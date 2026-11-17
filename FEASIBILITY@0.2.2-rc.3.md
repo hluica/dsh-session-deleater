@@ -1,11 +1,14 @@
-# 会话删除功能调查与独立插件提取（dsh-session-deleater）
+# 会话删除插件实施可行性（dsh-session-deleater）
 
 - 插件目录：`dsh-session-deleater`
 - 计划包名：`@local/dsh-session-deleater`
-- 调研对象：已安装插件 `dsh-session-manager` 0.7.8（`/Users/hanluica/.dsh/profiles/desktop/node_modules/dsh-session-manager`）
-- 调研时 DSH 版本：`0.2.2-rc.3`（Desktop，`DSH_PROFILE=desktop`）
-- 调研日期：2026-11-17
-- 轮次状态：**仅调研，不产生实现代码**。本文记录现有删除功能的实现、安全性/稳定性判断、提取方案与验收计划；实际代码等待用户新开一轮确认。
+- 计划版本：`0.1.0`
+- 目标 DSH 版本：`0.2.2-rc.3`（Desktop，`DSH_PROFILE=desktop`）
+- 设计日期：2026-11-17
+- 状态：**设计阶段，待用户确认；本轮不产生实现代码。**
+- 关联文档：
+  - [`TRACE.md`](TRACE.md)：对当前版本会话生成、落盘、缓存与外部副本的独立追踪，以及第 10 节的安全删除综合判断。
+  - [`REF-IMPLEMENTATION.md`](REF-IMPLEMENTATION.md)：对既有 `dsh-session-manager` 0.7.8 删除实现的调查记录。**本文不重复其实现细节**；它仅作为来源、许可证与历史证据保留。
 
 ---
 
@@ -13,900 +16,877 @@
 
 ### 1.1 目的
 
-1. 调查 `dsh-session-manager` 中“删除会话”功能的完整实现方式。
-2. 判断该实现是否足够安全、稳定，尤其是它依赖哪些 DSH 内部结构、这些依赖在升级时会不会静默失效。
-3. 评估把这部分功能提取为独立插件 `dsh-session-deleater` 的可行性，并给出可实施的架构、步骤与验收标准。
-4. 为后续在本工作区真正构建插件提供依据。
+构建一个独立插件，在 DSH Web/Desktop 中安全地删除单个会话，并满足：
 
-### 1.2 本轮边界
+1. 删除本机 DSH 存储中的会话日志、投影缓存、工作区/计划任务引用与客户端会话状态；
+2. 不误删工作区文件、不误删其它会话共享的附件、不误删同 id 的新生命周期；
+3. 删除失败或进程崩溃后可诊断、可重入，不产生“文件还在、列表已消失”的 torn state；
+4. 对热会话、附件、provider 副本等无法完全删除的内容，给出明确的范围承诺，而不是假装“彻底”。
 
-- 只做只读调查与文档，不修改 `dsh-session-manager`，不修改 DSH 安装，不删除任何真实会话。
-- 不实现 Host/Client 代码；不初始化 profile 依赖；不推送远程仓库。
-- 目标平台是当前 Desktop 安装（`0.2.2-rc.3`）；Web/CLI、其他 DSH 版本仅作为兼容性讨论。
-- 讨论的是“删除会话”本身，不把工作区归档、跨工作区移动、预设迁移等其它能力一并提取。
+### 1.2 范围
+
+**本插件负责：**
+
+- `<DSH_HOME>/sessions/<project>/<session>/` 下的会话日志目录（含全部格式代际、锁文件、临时文件）；
+- `<DSH_HOME>/storages/session_projcache/sessions/<id>.json` 及其旧版聚合形式；
+- `<DSH_HOME>/storages/workspace.json` 中的 `sessionIds`、`pinnedSessionIds`、`archivedSessionIds`；
+- `<DSH_HOME>/storages/schedule.json` 中引用该会话的任务（默认只停 active target，安全彻底模式清理全部引用）；
+- 浏览器 `localStorage` 中按会话 id 保存的草稿、侧栏布局、Browser tab、问题草稿、计划任务 tab 绑定、当前选择等；
+- 可选：仅被该会话引用的附件对象、request-image 缓存、provider 上传索引、spill 文件。
+
+**本插件不负责、也不承诺：**
+
+- 会话 `cwd` 下的工作区文件、项目目录、Git worktree；
+- 已发送给模型 provider 的官方 `dsh_session_log` 副本；
+- 已上传到 provider Files API 的远端文件；
+- OTel/产品分析/反馈导出/用户手动导出的文件；
+- 操作系统备份、Time Machine、APFS 快照；
+- Electron LevelDB 的取证级擦除、Chromium HTTP 缓存；
+- 多租户授权；本插件只服务本机 owner。
 
 ### 1.3 术语
 
 | 术语 | 含义 |
-| --- | --- |
-| 会话工件 | `<DSH_HOME>/sessions/<projectKey>/<encodeSegment(sessionId)>/session.v4.jsonl.zstd` 等持久化文件。 |
-| live 会话 | 当前进程中 `ctx.sessions.get(id)` 能取到的会话。 |
-| live writer | 当前进程中为某会话持有写句柄的持久化写入器。 |
-| 投影缓存 | `sessionProjectionCache` 持久化的逐会话 checkpoint；位于 `storages/session_projcache/`。 |
-| 级联删除 | 删除主会话时，递归删除 `origin === "subagent"` 的后代子智能体会话。 |
-| 静默降级 | 内部接口缺失时仍继续执行，只是跳过某项清理，不向用户报错。 |
+|---|---|
+| 冷会话 | 当前进程中 `ctx.sessions.get(id) === undefined`，仅存在于持久化存储。 |
+| 热会话 | 当前进程中已加载 Session/Agent，存在 live 写句柄或可运行 turn。 |
+| 提交点 | 本设计中指会话目录 `rename` 到隔离区的时刻；之后 canonical 路径已消失，删除语义已成立。 |
+| 投影缓存 | `session_projcache` 域的逐会话 checkpoint，包含标题、统计、提示词摘要等。 |
+| safe 模式 | 默认模式：删除日志/缓存/引用/客户端状态，保留附件与外部副本。 |
+| secure purge | 可选模式：额外回收仅被该会话引用的媒体，并清 request-image/provider 索引；仍不撤回远端副本。 |
 
 ---
 
 ## 2 结论摘要
 
-| 问题 | 结论 | 依据/代价 |
-| --- | --- | --- |
-| DSH 是否提供官方会话删除 API | **没有** | `dsh-session-persistence/README.zh.md` 明确“无删除或保留接口”；`dsh-workspace/README.zh.md` 明确会话删除“尚未提供”；`dsh-api-session-controller` 未发现删除会话的 Remote/Service 方法。 |
-| `dsh-session-manager` 怎么删 | **Host 侧“先安全停活、再脱离注册、再删文件、再清缓存”的带外删除** | Host 在 `/session-manager/api/delete` 中调用 `deleteSession()`；Client 只负责确认与刷新。 |
-| 路径/ID 安全 | **较强** | `assertSessionId`、`assertSessionDirectory`、header id 复核、符号链接/junction 拒绝、project/session 两层路径限定。 |
-| 认证与授权 | **较强** | 复用 DSH `connection.admit(req)`，要求 `owner` principal；跨站/无凭证失败关闭。 |
-| UI 安全性 | **较强** | 所有单条删除都必须经过二次确认；预览子会话失败时禁用确认按钮。 |
-| 是否“足够安全” | **对本地单人桌面基本够用，但不是事务性删除** | 仍有不可逆、部分失败后状态不一致、假 `session/disposed`、`pinnedSessionIds` 残留、并发输入竞态等问题。 |
-| 是否“足够稳定” | **中等偏脆弱** | 依赖 `sessions.store`、`agents.store`、`persistence.tracker`、`sessionProjectionCache.requireTable`、storage 表 `host.unit.descriptor`、`workspace entity.record` 等私有/未公开结构；部分缺失会静默跳过。 |
-| 能否提取为独立插件 | **可行，推荐“复制 + 加固”，不是原样照搬** | 删除核心与 UI 入口都可以独立；Host 可零 npm 依赖；Client 用公开 slot；需保留 MIT 归属并新增兼容探针。 |
-| 推荐首期范围 | **单条删除 + 级联 + 预览 + 标题栏/侧栏入口** | 批量删除/管理面板不是首期必需；可二期再做。 |
-| 是否需要重启 DSH | 实现完成后需要，因为 Host 插件与 Client bundle 变化不会在现有页面自动生效 | 按工作区规则，到那一步应停止并提示用户重启。 |
+| 问题 | 结论 | 依据 |
+|---|---|---|
+| DSH 是否提供官方会话删除 API | **没有** | `SessionPersistence` 只有 `create/open/stat/list/flush`；README 明确“no deletion API”；workspace 把会话删除列为未提供能力。 |
+| 能否安全删除冷会话 | **可以，接近事务性** | 用 `rename` 作为提交点 + journal + 启动清理；不依赖 live 私有面。 |
+| 能否删除热会话 | **可以删数据，不能立刻删干净内存** | 非公开 `sessions.store`/`entry.detach` + `agents.detachEntered` + `tracker` 可完成注册脱离；Agent scoped 资源留到进程退出。 |
+| 投影缓存会不会复活 | **用 tombstone 可以阻止本进程迟到写入** | `session/disposed` 仍会触发 `put`；必须在 detach 前安装生命周期 tombstone，并在提交后 `table.delete`。 |
+| 附件要不要删 | **默认保留，secure purge 可选** | 内容寻址、跨会话共享；实测 118 个对象中 3 个被两个会话共同引用。 |
+| 外部副本能不能删 | **不能** | 官方日志已上传、provider Files API 有远端文件、OTel/导出/备份均在工作区外。 |
+| 是否需要重启 DSH | **实现完成后需要** | Host 插件与 Client bundle 变化不会在当前页面自动生效。 |
+| 实现规模 | **约 1,200–1,800 行** | Host 600–800、Client 300–500、测试 200–400、文档/构建 100–200。 |
+
+**一句话判断：** 做一个“本机安全删除”插件是可行的；正确做法不是 `rm -rf`，而是“冷热分层 + rename 提交点 + journal + 缓存 tombstone + 能力探测”。
 
 ---
 
-## 3 现有实现：`dsh-session-manager` 0.7.8
+## 3 依据
 
-### 3.1 入口与调用链
+### 3.1 会话工件模型
 
-删除功能有三类 UI 入口：
+一个会话在本机留下的工件：
 
-1. 当前会话标题栏的“删除会话”按钮；
-2. 会话管理面板每行的删除按钮；
-3. 批量模式中的“删除会话”。
+| 工件 | 位置 | 说明 |
+|---|---|---|
+| 会话日志 | `~/.dsh/sessions/<projectKey>/<encodeSegment(id)>/session.vN.jsonl.zstd` | v4 当前；v0–v3 保留；必须删整个目录 |
+| 写锁 | 同目录 `session.lock` | POSIX `flock`；持锁期间不能 unlink |
+| 投影缓存 | `~/.dsh/storages/session_projcache/sessions/<id>.json` | 标题、统计、`turnOutline.prompt`、`titleInput` 等 |
+| 工作区成员 | `~/.dsh/storages/workspace.json` | `tables.workspaces[*].sessionIds` |
+| 工作区 pin/archive | 同上 | `global.pinnedSessionIds` / `global.archivedSessionIds` |
+| 计划任务 | `~/.dsh/storages/schedule.json` | `target.sessionId`、`involvedSessionIds`、`pendingDelivery.targetSessionId` |
+| 图片附件 | `~/.dsh/attachments/v1/objects/<2hex>/<sha256>` | 内容寻址，可共享 |
+| 文件附件 | `file-objects/<2hex>/<digest>` 与 `files/<2hex>/<digest>/<name>` | 内容寻址 + 硬链接引用 |
+| request-image 缓存 | `~/.dsh/cache/attachments/request-images/<2hex>/<hash>` | 派生图片，不能按 attachmentId 反查 |
+| provider 上传索引 | `~/.dsh/llm-deepseek/files-v3.json` | `attachmentId → fileId`，远端文件另存 |
+| spill 文件 | 默认 OS 临时目录；可配置 root | 会话级目录，默认 30 天清理 |
+| 客户端状态 | Electron localStorage | 草稿、侧栏布局、Browser tab、问题草稿、当前选择 |
+| 外部副本 | provider / OTel / 导出 / 备份 | 本机删除无法撤回 |
 
-它们最终都调用 Host 的同一个前缀 API：
+### 3.2 运行时证据
 
-- 前缀：`/session-manager/api`
-- 单条：`POST /delete`，body `{ sessionId }`
-- 批量：`POST /batch`，body `{ action: "delete", sessionIds: [...] }`
-- 预览：`GET /delete-preview?sessionId=...`（或 `sessionIds=a,b`）
+2026-11-17 追踪时的实际盘点：
 
-Client 端的单条删除调用在 `lib/client.js:7312` 附近的 `onRemove`：
+| 指标 | 值 | 说明 |
+|---|---:|---|
+| 会话目录 | 31 | 全部 `session.v4.jsonl.zstd` |
+| 投影缓存记录 | 35 | 其中 **4 份**对应日志已不存在 |
+| 孤儿缓存内容 | 4 | 仍含标题与 `turnOutline.prompt` 提示词片段 |
+| 附件对象 | 118 | 全部至少被一个会话引用 |
+| 共享附件 | 3 | 同一 attachmentId 出现在两个会话 |
+| provider 上传记录 | 118 | `files-v3.json` 全部有映射 |
+| 当前会话官方日志上传 | 追踪时 159 条 accepted，`throughSeq=1219` | 本地删除不能撤回 |
+| workspace | 15 个、28 个会话引用 | pin/archive 均为 0 |
 
-```js
-const response = await callApi("/delete", { sessionId });
-if (!response.ok) { ... throw ... }
-await annotationStore.load(true);
-if (wasCurrent || isCurrentSession(sessionId)) clearCurrentSession();
-await ctx.sessions?.refresh?.();
-await ctx.workspaces?.refresh?.();
-```
+这些数字是快照，不是契约；但它们证明了：
 
-Host 端路由注册在 `lib/index.js:2568`，删除分支在 `lib/index.js:2606`。真正的工作由 `deleteSession()`（`lib/index.js:2019`）完成。
+1. 只删日志会留下缓存中的标题/提示词（4 份孤儿）；
+2. 附件不能按会话盲删（3 份共享）；
+3. “本机删除”不等于“provider 删除”（159 条已上传）。
 
-### 3.2 Host 删除核心的分步行为
+### 3.3 DSH 能力与符号依据
 
-`deleteSession(sessionId)` 的主要步骤：
+| 能力 | 现状 | 本插件用法 |
+|---|---|---|
+| `SessionPersistence` 删除 API | 不存在 | 带外删除文件/缓存 |
+| `AgentHandle.dispose()` | 只返回给创建者 | 插件拿不到；热删除用非公开 registry detach |
+| `ctx.sessions` 按 id 移除 | 不存在 | 用 `sessions.store` + `entry.detach()`（非公开） |
+| `ctx.agents` 按 id dispose | 不存在 | 用 `agents.store` + `detachEntered(entry)`（非公开） |
+| `sessionProjectionCache` 删除 | 无公开 API | `requireTable()`/`storageDomain.get` + 生命周期 tombstone |
+| `workspace.detachSession`/`unpinSession`/`unarchiveSession` | 公开 | 直接调用 |
+| `workspace/session-stop` | 公开 parallel 事件 | 停止 turn/jobs/subagents/schedule active |
+| `schedule.list`/`edit` | 公开 | secure purge 清理全部引用 |
+| `api-session/removed` | Host 内部 emit 事件 | 冷会话通知 API 列表移除 |
+| `session/disposed` | `(session: Session) => void` | live 会话由真实 `entry.detach()` 发出；冷会话不得伪造 |
 
-1. **ID 断言**：`assertSessionId`，拒绝空、`.`、`..`、路径分隔符、控制字符等。
-2. **发现后代子智能体**：`findDescendantSubagents([sessionId])`（`lib/index.js:1883`），只沿着 `origin === "subagent"` 且 `parentSession` 指向当前父会话的头链遍历。扫描不完整时直接拒绝删除。
-3. **删除前统一预检**：对主会话与所有后代：
-   - 再次 `assertSessionId`；
-   - `sessionDirOf()` 解析并 `assertSessionDirectory()` 校验目录；
-   - `assertAndStopActiveSession()` 检查活动状态，必要时取消并等待空闲。
-4. **先删后代，再删主会话**：`deletePlan = [...descendants].reverse()`；每个后代在 `mutate(sub.id, ...)` 中单独删除，删除成功后把 id 记入 `deletedSubagentIds`，并从 `remainingSubagentIds` 移除。
-5. **主会话删除**（`lib/index.js:2094` 起）：
-   - 解析目录、live session、live agent；
-   - 安装投影缓存删除防护 `beginProjectionCacheDeletion`；
-   - 取消 agent、等待空闲、从 `ctx.agents.store` 移除注册；
-   - `ctx.sessions.flush(session)`，然后 `entry.detach()`，让持久化完成最后一次排空，并让 API controller 发出 `host/session-removed`；
-   - 若没有 live entry，则手动 `ctx.emit("session/disposed", { id: sessionId })`；
-   - `closeSessionWriters()` 关闭并等待所有写句柄；
-   - `detachFromWorkspaces()`、`unarchiveSession()`；
-   - `rm(dir, { recursive: true, force: true })` 删除会话目录；
-   - 删除投影缓存、旧版聚合缓存；
-   - 删除标记存储、工作区归档记录；
-   - 返回 `{ ok, warning?, sessionId, wasLive, filesRemoved, deletedSubagents, subagentCount }`。
-6. **失败处理**：若会话工件尚未删除，回滚投影缓存 tombstone；若已有后代被删，错误对象带 `deletedSubagentIds`、`remainingSessionIds`、`partialFailure`，HTTP 响应也带这些字段。
+### 3.4 设计不变量
 
-### 3.3 路径与工件解析
+1. **日志 append-only**：不能原地改写；删除只能整目录删除。
+2. **内容寻址附件共享**：删除前必须扫描剩余会话引用；不能读全量剩余会话时保留。
+3. **单写者**：写锁保护 writer；删除不得在持锁 writer 活跃时 unlink 锁文件。
+4. **懒物化**：创建不等于落盘；pending 会话可能没有目录。
+5. **缓存写后**：`session/disposed` 仍会触发缓存 `put`；必须 tombstone。
+6. **外部副本不可撤回**：产品必须分层承诺。
 
-`lib/session-files.js` 承担文件层安全：
+### 3.5 参考文档的定位
 
-- `assertSessionId`（`:22`）：拒绝路径分隔符、控制字符、`<>"|?*`、结尾点/空格、`.`/`..`。
-- `encodeFsSessionSegment`（`:58`）：与 DSH `encodeSegment` 相同的 `~XXXX` 转义规则。
-- `candidateSessionDirs`（`:125`）：主编码目录、raw id、旧版 projectKey 形式。
-- `assertSessionDirectory`（`:139`）：
-  - 只允许 `<sessions root>/<project>/<sessionDir>` 恰好两层；
-  - `sessionDir` 必须是候选目录之一；
-  - 逐层 `lstat`，拒绝符号链接/junction/普通文件；
-  - 逐层 `realpath`，拒绝解析到 root 之外；
-  - root 本身允许是符号链接（DSH 允许 home 通过链接配置）。
-- `readSessionHeader`（`:189`）：只读第一行，校验 header；`readSessionFile`（`:214`）要求完整 JSONL 且尾部换行。
-- 删除前用 `sessionDirOf()`（`lib/index.js:1870`）读工件 header，确认 `header.id === sessionId`，才返回目录。这样“目录名刚好等于用户输入”不会导致误删。
-
-### 3.4 子智能体级联
-
-`findDescendantSubagents` 会合并三类来源：
-
-- `adapter.cachedSessionHeaders()`（workspace registry 的内存 header 缓存）；
-- `ctx.sessions.list()` 的 live header；
-- `scanSessionHeaders()`（`lib/index.js` 约 `:124`）扫描持久化索引和磁盘目录。
-
-只有 `origin === "subagent"` 且 `parentSession` 链能连到根会话的头才会进入结果；fork 会话（`origin !== "subagent"`）不会被级联删除。每个后代还要求“有可验证目录或 live 状态”，否则不纳入。
-
-扫描结果带 `complete` 标志：只要持久化列表失败、任一目录不可读、header 不一致、目录名与 header 不匹配，`complete` 就是 false，删除预览/删除都会拒绝。这是有意为之的“失败关闭”，代价是**一个损坏会话可能阻塞所有删除**。
-
-### 3.5 活动停止
-
-`assertAndStopActiveSession`（`lib/index.js:1955`）在删除前做：
-
-1. 读 live session 的 `activeTurn`、live agent 的 `status/busy`；
-2. 通过 `ctx.waterfall("workspace/session-activity", { sessionId }, ...)` 询问其它插件还有什么活动（后台任务、定时任务等）；
-3. 若没有停止接口，直接拒绝；
-4. 若有 agent，调用 `agent.cancel({ kind: "disposed" })`，再等 `whenIdle()`；
-5. 若 registry 有 `stopSessionActivity`，调用它；否则用 `ctx.parallel("workspace/session-stop", ...)`；
-6. 再检查 agent 是否仍在运行、`workspace/session-activity` 是否还有剩余活动；
-7. 任何一步超时（`awaitSessionStep` 默认 3000ms）都会抛错并停止后续删除。
-
-`workspace/session-activity` 与 `workspace/session-stop` 是 DSH 组合层面的公开事件：前者是 waterfall，后者是 parallel；`dsh-agent`、`dsh-jobs`、`dsh-schedule`、`dsh-subagent` 等提供方会在这两个事件里报告/停止自己的工作。因此删除一个空闲但仍有活动定时任务的会话时，这些任务会被一并停掉，而不是留到删除后继续投递。
-
-需要注意语义：`workspace/session-stop` 的文档描述是“调用方以 `stopActivity` 归档会话时，停止其运行中的工作”，删除路径是**借用**它来停止活动，因为 DSH 没有 delete 专用的 stop 事件。当前提供方的实现只执行停止动作，不依赖归档集合，所以可用；但如果未来某个提供方开始检查“归档标记是否已持久化”，删除路径的借用就会失配。提取版应把这条调用封装在 `stopSessionActivityForDelete()` 中，并在升级时回归。
-
-### 3.6 持久化 writer 与投影缓存
-
-**writer 处理**（`lib/compat/session-lifecycle.js`）：
-
-- `sessionWriters`（`:17`）从 `persistence.tracker.writers` 和 `persistence.tracker.openHandles` 收集该会话的写句柄。
-- `closeSessionWriters`（`:28`）逐个 `writer.close()`，然后等待 `persistence.coordinator.retirements`（如果存在），最后检查 `persistence.coordinator.states` 是否仍有 owner。任何写句柄没有 `close` 方法都会抛错，阻止删文件。
-- `awaitSessionStep`（`:2`）统一给这些步骤加 3 秒上限。
-
-**投影缓存**（`lib/compat/projection-cache-delete.js`）：
-
-- `beginProjectionCacheDeletion`（`:16`）在 `table` 的 `put` 上安装 tombstone：删除前把该会话生命周期身份（`createdAt`、`cwd`、`isSeeded`）写入 `removed` 集合；之后同一生命周期的延迟 `put` 被忽略，防止“删了会话又被迟到写入写回缓存”。
-- `remove()` 调用 `table.delete(id)`。
-- 若删除失败且工件未删，`rollback()` 撤销 tombstone。
-- `assertProjectionCachePath`（`:63`）逐段检查缓存路径不是符号链接。
-- `removeLegacyProjectionCache`（`:78`）对旧版 `storages/session_projcache.json` 使用独立 lock 文件（`session_projcache.session-manager.lock`）串行化，校验 unit 名称/版本/表结构，然后用 `replaceSessionFile` 原子替换；未知格式拒绝修改。
-
-### 3.7 工作区、归档、标记清理
-
-- `detachFromWorkspaces`（`lib/index.js:606`）遍历 `workspaceRegistry.list()`，用 `entity.record.sessionIds`（私有字段）判断归属，再调用公开的 `entity.detachSession(sessionId)`。
-- `unarchiveSession`（`lib/index.js:474`）优先 `uiWorkspace.unarchiveSession`，其次 `workspaceRegistry.unarchiveSession`，最后才用 `enqueueOperation/requireState/setState` 直接改状态。
-- 标记存储与工作区归档存储是 `dsh-session-manager` 自己的数据（`annotations.v1.json`、workspace archive store），删除路径会尽力清理；失败只记 warning。
-- **没有清理 `pinnedSessionIds`**：删除一个已置顶但未归档的会话后，pin 集合里仍保留该 id。`workspaceRegistry` 有公开的 `unpinSession`（`dsh-workspace/src/index.ts:477`），但删除路径没有调用。
-
-### 3.8 Client UI
-
-- 标题栏删除按钮在 `lib/client.js:6491` 附近；面板行删除按钮在 `:5284` 附近；批量删除在 `:4880` 附近。
-- 单条删除的确认对话框在 `:6631`；确认前会请求 `/delete-preview`，加载中或预览失败时 `confirmDisabled` 为 true（`:5982` 附近的批量版本同理）。
-- 警告文案包含“正在运行，删除将立即中断它”和“将连带删除 N 个关联的子智能体会话”。
-- 删除失败时，`onRemove` 只把 `response.error` 包装成 Error；`runWithAlert`（`:6238`）只显示 `error.message`，**没有展示 `deletedSubagents`/`remainingSessions`**。批量结果对话框则逐条展示。
-- 成功后若删的是当前会话，调用 `clearCurrentSession()`，再 `ctx.sessions.refresh()`、`ctx.workspaces.refresh()`。
-
-### 3.9 API 认证
-
-`authenticateApiRequest`（`lib/index.js:2521`）在读取 body 之前调用：
-
-```js
-const admission = connection.admit(req);
-if ("rejection" in admission) { ... 401/403 ... }
-if (admission.peer?.principal?.kind !== "owner") { ... 403 ... }
-```
-
-`connection` 是 DSH 的公开 Host 服务；`dsh-client-connection/src/index.ts:151` 自身也用同一 `admit()` 保护 `/api`，`rpc.ts:240` 把 `admit()` 声明在公开接口上。因此这条认证路径是稳定的，且能拒绝无凭证、跨站、非 owner 的请求。
+- `REF-IMPLEMENTATION.md` 记录的是“既有插件怎么做”的调查，不是本插件的规范；本文的实现决策以其结论与 `TRACE.md` 的证据为基础，只在许可证与历史来源处引用它。
+- `TRACE.md` §10 是本文安全判断的直接来源；本文把它收敛为可执行的契约、阶段和验收。
 
 ---
 
-## 4 安全性分析
+## 4 核心进路
 
-### 4.1 威胁模型
-
-考虑四类风险：
-
-1. **误删/越界删除**：用户输入或恶意请求导致删除 sessions 目录之外的文件。
-2. **并发/生命周期错误**：删除时还有写入、运行中的 turn、定时任务或新输入，导致数据损坏或“删了又回来”。
-3. **不可逆操作的部分失败**：删除到一半失败，留下既不在列表里、又没删干净的状态。
-4. **越权调用**：非 owner 或跨站页面调用删除 API。
-
-### 4.2 做得好、应当保留的部分
-
-| 机制 | 评价 |
-| --- | --- |
-| ID 白名单式校验 + 路径两层限定 | 强。即使 `sessionId` 来自 HTTP，也无法直接拼接出 `../` 路径。 |
-| header id 复核 | 强。不会因为目录名碰巧匹配就删除。 |
-| 符号链接/junction 拒绝 + realpath 限定 | 强。root 可链接，但 project/session 子目录不可链接。 |
-| 删除前预检所有后代 | 强。避免“删了一半后代才发现主会话不能删”。 |
-| `workspace/session-activity` + `workspace/session-stop` | 设计好。让 schedule/jobs 等提供方按公开事件停止自己的工作。 |
-| writer close + `flush` + `detach` | 方向正确。先排空、再脱离、再删文件。 |
-| 投影缓存 tombstone | 设计好。解决“删除后迟到写入把缓存写回”的竞态。 |
-| 旧版缓存 lock + 原子替换 | 设计好。避免并发删除破坏聚合 JSON。 |
-| owner-only + 跨站防护 | 强。认证失败关闭。 |
-| UI 二次确认 + 预览失败禁用确认 | 强。破坏性操作没有“一键误删”路径。 |
-| 部分失败显式返回 | 方向正确。至少 batch 与 HTTP 响应知道哪些后代已删。 |
-
-### 4.3 残余风险
-
-#### R1. 不可逆，且删除中途失败可能出现“文件还在、列表已消失”
-
-**证据**：`lib/index.js:2158-2166` 的顺序是：
-
-```js
-await detachFromWorkspaces(sessionId);
-await unarchiveSession(sessionId);
-if (dir !== undefined) {
-  await assertSessionDirectory(...);
-  await rm(dir, { recursive: true, force: true });
-}
-```
-
-在 `rm` 之前，live session 已经被 `detach()`，agent 已经被取消/移除。若 `detachFromWorkspaces`、`unarchiveSession` 或删除前的最后一次 `assertSessionDirectory` 抛错，代码进入 `catch`：
-
-- `artifactsDeleted` 仍为 false，`projectionDeletion.rollback()` 只回滚缓存 tombstone；
-- **不会重新 attach session/agent，也不会把会话重新挂回工作区**；
-- 文件还在磁盘上，但当前 UI 已收到 `session/disposed`/`host/session-removed`，列表里没有它；
-- 用户无法从 UI 重试；下次启动时 boot reconcile 可能把它重新挂回，表现为“删除失败后又回来了”。
-
-这是**最值得在提取版修正的顺序问题**。同理，`closeSessionWriters` 失败、`entry.detach()` 失败也会留下类似状态。
-
-**修法**：把所有“删除后清理”类操作（workspace detach、unpin、unarchive、缓存、标记）移到 `rm` 成功之后，并降级为 warning；`rm` 之前只保留必须前置的验证与 live teardown。进一步缩短 torn window：把 `entry.detach()` 紧贴 `rm` 之前执行，而不是在所有清理步骤之前；若 `rm` 失败且在进程内仍持有 session 对象，尝试重新 `enter`/`attach` 恢复（做不到就明确报告残留路径与重启后的行为）。若 `rm` 失败，明确报告“会话文件仍在 `<path>`，重启后可能重新出现”，并尽量提供恢复入口。
-
-#### R2. 没有 live entry 时伪造 `session/disposed`
-
-**证据**：`lib/index.js:2148-2150`：
-
-```js
-if (!detached) {
-  if (typeof ctx.emit === "function") ctx.emit("session/disposed", { id: sessionId });
-}
-```
-
-但 `session/disposed` 的公开签名是 `(session: Session)`（`dsh-session/src/index.ts:65`、Event Inspect 的 `Session` 类型）。这里传的是 `{ id }`，不是 `Session` 实例。
-
-**影响**：
-
-- API controller 只读 `session.id`，所以列表删除仍然生效；
-- 但其它监听器会拿到不合约的对象。多数监听器用 `Map<Session, ...>` 做 key，冷会话通常没有状态，所以实际多半静默无操作；`dsh-session-title`、`dsh-session-projection-cache`、`dsh-client-file-upload`、`dsh-client-ui-trajectory`、`dsh-workspace-changes`、`dsh-session-telemetry` 都属于这一类。
-- **没有监听器错误隔离**：真实的 `session/disposed` 由 `SessionStore.emitDisposed`（`dsh-session/src/index.ts:1399-1406`）逐个监听器 `try/catch` 并记录；这里直接 `ctx.emit`，Cordis 的普通 emit 不做这种隔离。任何一个监听器同步抛错，都会在 `entry.detach()` 已经执行之后把异常抛出，触发 `catch (parentErr)`，导致“客户端行已消失、磁盘文件还在、工作区和缓存都没清”的 torn state（与 R1 同源）。
-- 风险还在于**依赖了不合法的生命周期边**；未来某个监听器如果对 `session.header`/`session.id` 之外做校验，就可能抛错或误清理。
-
-**修法**：冷会话不要伪造 `session/disposed`。更干净的做法是发一个 payload 精确的 `api-session/removed`（Event Inspect 签名 `(sessionId: SessionId) => void`，`mode: emit`），让 API 列表删除该行；live 会话仍由真实的 `entry.detach()` 发 `session/disposed`。`api-session/removed` 是 `dsh-api-remotes` 转发到客户端的白名单事件，payload 简单，且不需要构造假 Session。即便如此也应 `try/catch`，避免监听器异常影响删除主流程。若担心它属于 API 包内部契约，至少应在提取版把这条路径隔离在一个兼容函数里，并在 DSH 升级时回归。
-
-#### R3. `pinnedSessionIds` 残留
-
-**证据**：删除路径只调用 `unarchiveSession`（`lib/index.js:2159`），没有 `unpinSession`。`dsh-workspace/src/index.ts:477` 有公开的 `unpinSession`。
-
-**影响**：已置顶会话删除后，`storages/workspace.json` 的 `pinnedSessionIds` 仍含该 id。UI 通常会与已知会话取交集，所以不一定显示幽灵行；但状态会积累，且如果 id 被复用（UUID 概率极低）会继承置顶。属于低到中等严重度的清理缺陷。
-
-**修法**：删除成功后尽力调用 `workspaceRegistry.unpinSession(sessionId)`；失败只记 warning。
-
-#### R4. 主会话的“停止活动 → detach”之间仍有新输入竞态
-
-**证据**：主会话在预检里调用一次 `assertAndStopActiveSession`；之后在 `lib/index.js:2094-2155` 只做 `agent.cancel` + `whenIdle` + `flush` + `detach`，没有再次检查 `workspace/session-activity` 或新的 live agent。后代因为 `skipSubagents` 分支会再调用一次 `assertAndStopActiveSession`，主会话没有同等复查。
-
-**影响**：多客户端/定时投递在预检后、detach 前的新输入理论上可以启动新一轮；`cancel({ kind: "disposed" })` 会抑制一部分 re-wake，但代码没有证明所有入口都被堵住。窗口很小，但不是零。
-
-更严重的是 **resume 与重新 materialize 的窗口**：`dsh-session-persistence-jsonl` 的写打开会 `claimWrite`，而持久化批次在 `materialized: false` 时会走 `materialize()`，其内部 `mkdir(project/dir, { recursive: true })`（`.../src/index.ts:911-925`、`:1284-1295`）。如果删除流程在“writer 已关、目录尚未删/刚删”的窗口内遇到并发的 resume 或同 id 新建，理论上可以重新创建会话目录。注意：`open(id, "write")` 对已删除工件会先 `findLog` 并抛 `SessionPersistenceNotFoundError`（`.../src/index.ts:426-427`），所以这条链能否真正触发取决于调用方是否走“新建/待 materialize”路径；本次未做实机复现，**应作为待验证的高风险竞态**，而不是已证实漏洞。
-
-**修法**：在 `flush` 之后、`detach` 之前再次执行活动检查；若出现新活动，停止并报错，不继续删文件。或者引入插件级“deleting”集合，在 API 层拒绝同一会话的新操作（但这不能阻止其它插件的直接调用）。最稳妥的是先 `rename` 会话目录到隔离名（同目录 `.deleting-<id>-<random>`），再删；这样即使有并发 materialize，也会落到新目录，删除完成后可检测并清理。
-
-#### R5. 私有内部结构缺失时静默降级
-
-**证据**：
-
-- `sessionWriters`（`lib/compat/session-lifecycle.js:17`）读 `persistence.tracker.writers/openHandles`；若 `tracker` 不存在，返回空数组。
-- `closeSessionWriters`（`:28`）对空数组直接通过，不报错。
-- `lib/index.js:2120` 移除 agent 注册时：
-
-  ```js
-  else if (!entry || entry === agent || entry.agent === agent) ctx.agents?.store?.delete?.(sessionId);
-  ```
-
-  若 `store.delete` 不存在，`?.` 让整句静默跳过，agent 注册可能残留。
-- `entry.detach()` 若 `ctx.sessions.store` 不存在，`detached` 为 false，走伪造事件路径。
-- `closeSessionWriters` 还会检查 `persistence.coordinator.retirements/states`（`:33-37`）；但 **0.2.2-rc.3 的 JSONL 后端没有 `coordinator`**（对该版本 `@deepseek-ai/*` 的 `src/*.ts` 检索，只有 `dsh-session-telemetry` 使用同名概念，与持久化无关）。因此这段 owner 检查在本版本是死代码，永远静默通过。
-
-**影响**：DSH 升级把 `store`/`tracker`/`detachEntered` 改名或改成原生私有字段后，插件不会在加载时失败，而是**照常返回成功，只是没有关闭 writer / 没有移除 agent / 没有发真实 disposed 事件**。这比直接报错更危险：用户以为删除成功，实际可能留下可继续写入的句柄或幽灵注册。`coordinator` 死代码还会给人“已经检查过 writer owner”的错觉。
-
-**修法**：提取版应把“能力探测”变成前置条件：
-
-- 若存在 live session/agent，但拿不到 `sessions.store`、`entry.detach`、`agents.store`、`agents.detachEntered`，直接在前置检查阶段失败；
-- 若存在 live writer 但 `persistence.tracker` 取不到，直接失败；
-- `closeSessionWriters` 改为“支持标志 + 期望写句柄数”，不再用空数组表示成功；
-- 所有 `?.` 只用于可选的**清理**步骤，不用于关键的**生命周期脱离**步骤。
-
-#### R6. 全局扫描不完整会阻塞所有删除
-
-**证据**：`findDescendantSubagents`（`lib/index.js:1883`）要求 `scanSessionHeaders` 的 `complete` 为 true；`scanSessionHeaders` 对每个无法完整读取的会话目录 `push` error（`lib/index.js` 约 `:203`）。`delete-preview` 失败后，Client 的确认按钮被禁用。
-
-**影响**：一个损坏的会话工件、一个权限异常的目录、一个符号链接项目目录，都可能让**所有会话**无法删除。这是安全优先的取舍，但对用户是“为什么删不掉”的困惑来源。
-
-**修法**：保留失败关闭作为默认，但提供更细的诊断（列出阻塞的目录/原因）；可考虑在提取版加一个明确的“仅删除指定会话，不扫描无关损坏项”的受限模式，但必须确保子会话级联完整性，不能为了可用性牺牲正确性。
-
-#### R7. 删除失败留下的空目录会反过来阻塞后续删除
-
-**证据**：`scanSessionHeaders` 对“扫描到但读不出任何工件”的未知会话目录会 `errors.push("无法完整读取会话目录: ...")`（`lib/index.js` 约 `:203`）。而 `findDescendantSubagents` 只要 `complete === false` 就抛错，`delete-preview` 失败后 Client 禁用确认。
-
-**影响**：R1 的部分 `rm` 失败、手工清理残留、旧版迁移中断，都可能留下一个没有 `session.*.jsonl*` 的目录。这个空目录会让**之后所有删除**的预览都失败，形成“删一次失败，从此删不了”的死锁；用户只能手工去 `~/.dsh/sessions/...` 清理。这是比“单个损坏会话阻塞”更现实的连锁故障。
-
-**修法**：区分“空目录/无工件”与“有工件但不可读”：
-
-- 空目录（没有任何 `session.*.jsonl*`）可以跳过并记 warning，它不可能藏有子会话；
-- 有工件但 header 不可读/目录名不一致，才计入 `complete=false`；
-- 删除失败时报告残留路径，方便用户清理；
-- 提取版的 `scanSessionHeaders` 应把“无关空目录”视为可忽略，而不是全局错误。
-
-#### R8. 旧版缓存 lock 的陈旧锁
-
-**证据**：`removeLegacyProjectionCache`（`lib/compat/projection-cache-delete.js:78`）用 `session_projcache.session-manager.lock`，只在 `finally` 中按 token 删除；进程崩溃会留下 lock 文件，之后 3 秒超时并报“锁正被占用”。
-
-**影响**：0.2.2 默认是 `per-record` 布局，旧聚合文件通常不存在，所以影响面小；但一旦存在，崩溃后需要人工删除 lock 才能继续清理旧缓存。
-
-**修法**：lock 文件写入 pid/时间戳，超时后检查 pid 是否存活或 mtime 是否过旧；或者把旧缓存清理完全降级为“下次启动再试”的后台任务。
-
-另外两个低风险边角：
-
-- **tombstone 成功删除后不回收**：`beginProjectionCacheDeletion` 把该生命周期的 key 写进 `guard.removed`，`remove()` 成功后没有清除（`lib/compat/projection-cache-delete.js:34-36`）。同一进程反复删除会缓慢累积；如果用户从备份还原“同 id + 同 createdAt + 同 cwd”的会话，它的缓存写入会被永久静默丢弃。修法：`remove()` 成功后按 id 清理，或把 guard 限定在短时间窗口。
-- **`rm` 半失败时过早回滚 tombstone**：`catch (parentErr)` 只在 `artifactsDeleted === false` 时 `projectionDeletion.rollback()`（`lib/index.js:2217-2218`）。如果 `rm` 已经删了一部分文件才抛错，`artifactsDeleted` 仍为 false，tombstone 被撤销，残存的会话可能重新接受缓存写入，留下不一致的缓存行。修法：在开始 `rm` 前就把“工件正在删除”标记为不可回滚，或在 `rm` 失败后禁止该 id 的缓存写入一段时间。
-
-#### R9. 删除后残留的其它数据
-
-| 数据 | 是否清理 | 影响 |
-| --- | --- | --- |
-| session 工件目录 | 是 | 主目标 |
-| 投影缓存 | 是（失败 warning） | 失败时磁盘残留 |
-| `pinnedSessionIds` | **否** | 见 R3 |
-| `archivedSessionIds` | 是（`unarchiveSession`） | 正常 |
-| workspace `sessionIds` | 是（detach） | 若失败，boot reconcile 兜底 |
-| `dsh-session-manager` 的 annotations | 是（尽力） | 独立插件无法知道该格式 |
-| `dsh-session-manager` 的 workspace archive store | 是（尽力） | 同上 |
-| spill 文件（`dsh-spill-local`） | **否** | 按 `cleanupPeriodDays`（默认 30 天）后清理，或 OS 临时目录清理 |
-| attachments | **否** | 内容寻址，可能被其它会话共享；不删是安全的 |
-| session query SQLite 索引 | 间接 | 下次搜索 reconcile 时删除；不是实时 |
-| 定时任务 | 通过 `workspace/session-stop` | schedule 会删除目标为该会话的活动任务 |
-| 后台 jobs | 通过 `workspace/session-stop` | jobs 提供方停止 |
-| Git worktree / 项目目录 | **否** | 正确：删除会话不应删除项目或工作树 |
-
-这些残留大多是可接受的“保守清理”，但 README 应如实说明，避免用户误以为“磁盘上一点不剩”。
-
-#### R10. 部分失败的用户告知不足
-
-**证据**：Host 在部分失败时返回 `deletedSubagents`、`remainingSessions`、`partialFailure`；`onRemove`（`lib/client.js:7312`）把这些挂在 Error 上，但 `runWithAlert`（`:6238`）只显示 `error.message`。单条删除的对话框不会列出“已删了哪些子会话、还剩哪些”。
-
-**影响**：用户可能不知道删除已经部分发生，也不知道该重试哪个 id。批量模式的结果对话框做得更好，但单条模式没有对齐。
-
-**修法**：提取版的错误对话框直接渲染 `deletedSubagents` 与 `remainingSessions`；成功但有 warning 时也展示 warning，而不是只 `window.alert`。
-
-#### R11. 标题栏删除路径不显示“正在运行”警告
-
-**证据**：标题栏与“更多操作”菜单打开确认框时只传 `{ id, displayTitle }`（`lib/client.js:6506`、`:6621`），而确认框的警告文案读取 `confirmFor.running`（`:5988`）；行删除路径传的是整行对象 `s`（`:5289`），所以行路径有 running 信息，标题栏路径没有。
-
-**影响**：用户从标题栏删除一个正在运行的会话时，只看到“不可撤销”，看不到“删除将立即中断它”。这不会让删除变得不安全（Host 仍会停止活动），但会让用户对“为什么任务被中断”感到意外。
-
-**修法**：提取版从 `useSessions`/`useSessionStatus` 读取当前 `sessionId` 的 running 状态，传入确认框；不要依赖确认对象里恰好带了 `running`。
-
-#### R12. 其它低风险点
-
-- **TOCTOU**：`assertSessionDirectory` 与 `rm` 之间仍有极短窗口；Node 的 `rm` 不跟随符号链接，且删除前会再校验一次，实际风险低。
-- **`entity.record` 私有**：`detachFromWorkspaces` 依赖 `entity.record.sessionIds`；若字段改名，会退化为 `entity.sessionIds` 过滤视图，可能漏掉 stale 成员，但 boot reconcile 会兜底。
-- **`ctx.emit` 伪造事件**：见 R2。
-- **HTTP body 限制**：64 KiB；批量预览用 query string，200 个 id 可能接近 URL 长度限制；单条删除不受影响。
-- **`rm` 的 Windows 重试**：没有 `maxRetries`；Windows 上锁文件/杀毒软件短暂占用可能导致 `EBUSY/EPERM`，删除失败。
-- **不可逆**：没有回收站/备份。README 明确“不可逆”，UI 也二次确认，但这是产品选择，不是 bug。
-
-### 4.4 安全性结论
-
-- **越界删除/路径注入**：防护充分，未发现可直接利用的路径穿越。
-- **越权调用**：防护充分，owner-only + DSH connection 的 Host/Origin 检查。
-- **误操作**：确认流程充分；但“部分失败后列表消失、文件残留”会制造难以理解的状态。
-- **数据完整性**：前置验证与 writer/cache 处理方向正确；主要缺陷是“清理顺序”和“私有接口缺失时静默降级”。
-
-**判断**：对本地单人桌面、在固定 DSH 版本上使用，它“基本安全”；但它不是事务性删除，也不是可以无脑信任的通用删除原语。提取版应当保留其防御性设计，并修正 R1/R2/R3/R5/R7/R10/R11。
-
----
-
-## 5 稳定性与版本耦合
-
-### 5.1 删除路径依赖的 DSH 内部符号
-
-| 符号 | DSH 位置 | 可见性 | 用途 | 缺失时当前行为 |
-| --- | --- | --- | --- | --- |
-| `ctx.sessions.store` | `dsh-session/src/index.ts:1145` | TS `private` | 取 `SessionEntry`，调用 `entry.detach()` | 退化为 `ctx.emit("session/disposed", {id})`（伪造） |
-| `SessionEntry.detach` | `dsh-session/src/index.ts:1326` | 实例字段，非公开 API | 从 store 移除并发 disposed | 同上 |
-| `ctx.agents.store` | `dsh-agent/src/index.ts:250` | TS `private` | 取 `AgentEntry`，移除 agent 注册 | `?.` 静默跳过，可能残留 agent |
-| `ctx.agents.detachEntered` | `dsh-agent/src/index.ts:511` | TS `private` | 正确移除 agent 并 emit `agent/disposed` | 退化为 `store.delete`，不发 disposed |
-| `persistence.tracker` | `dsh-session-persistence-jsonl/src/index.ts:316` | TS `private readonly` | 读写句柄/打开句柄集合 | `sessionWriters` 返回空，删除照常继续 |
-| `tracker.writers` | `.../src/storage.ts:395` | TS `private` | 找该会话 writer | 空数组 |
-| `tracker.openHandles` | `.../src/storage.ts:393` | `readonly` 公开字段 | 找已打开写句柄 | 空集合 |
-| `persistence.coordinator` | 0.2.2-rc.3 **未发现（死代码）** | — | 等待 retirement / 检查 owner | 永远跳过，给人“已检查 owner”的错觉 |
-| `sessionProjectionCache.requireTable` | `dsh-session-projection-cache/src/index.ts:398` | TS `private` | 取缓存表，安装 tombstone/删除 | `beginProjectionCacheDeletion` 返回 undefined，缓存清理降级 |
-| `table.host.unit.descriptor.layout` | `dsh-storage-domain/src/domain.ts:197` + `dsh-storage-json` 单元的私有 `descriptor` | 深层内部 | 判断 per-record vs 旧聚合 | 旧版判断失效，最坏只留 warning |
-| `entity.record` | `dsh-workspace/src/entity.ts:71` | TS `private` | 读持久化 `sessionIds` | 退化为过滤视图，可能漏 stale 成员 |
-| `workspaceRegistry.stopSessionActivity` | `dsh-workspace/src/index.ts:504` | TS `private` | 停止活动 | 回退到公开 `ctx.parallel("workspace/session-stop")` |
-| `ctx.sessions.flush` | `dsh-session/src/index.ts:1422` | **公开** | 排空缓冲事件 | 不涉及 |
-| `ctx.sessions.get/list` | 公开 | 公开 | 读 live 状态 | 不涉及 |
-| `ctx.agent.cancel/whenIdle` | `dsh-agent/src/runtime-types.ts:213/221` | 公开 | 取消并等待空闲 | 不涉及 |
-| `workspaceRegistry.unarchiveSession` | `dsh-workspace/src/index.ts:420` | 公开 | 移出归档集合 | 有 fallback，最终失败则中止 |
-| `workspaceRegistry.unpinSession` | `dsh-workspace/src/index.ts:477` | 公开，但**未使用** | 清理 pin | pin 残留 |
-| `SessionPersistence.list` | 公开 | 公开 | 列表 | 磁盘 fallback |
-| `SessionPersistence.locate` | `dsh-session-persistence-jsonl/src/index.ts:345` | TS `private` | 定位工件路径的提示 | 回退磁盘扫描（安全降级） |
-| `connection.admit` | `dsh-client-connection/src/index.ts:151` + `rpc.ts:240` | 公开接口 | 认证 | 插件不加载（required inject） |
-
-### 5.2 为什么这些私有依赖是必要的
-
-DSH 0.2.2-rc.3 **没有**以下任一官方能力：
-
-- `sessionPersistence.delete()` / `prune()`：`dsh-session-persistence/README.zh.md:153` 明确“无删除或保留接口——剪枝已存储会话属于带外后端维护”。
-- `workspaceRegistry.deleteSession()`：`dsh-workspace/README.zh.md:171` 明确“会话删除与文件夹移除是彼此独立且尚未提供的功能”。
-- `api-session-controller` 的 delete Remote：没有。
-- `AgentHandle.dispose()` 可供第三方使用：`AgentHandle` 是创建者能力，`ctx.agents.get()` 只返回裸 `Agent`，不暴露 handle。
-- `SessionReference.release()`：只拆除内存绑定，不删除工件。
-
-因此，**任何第三方删除插件都必须做带外文件删除**，并至少触碰 `sessions` store 与 persistence 的一些内部状态。这是平台缺口，不是 `dsh-session-manager` 的过度设计。
-
-### 5.3 版本升级风险
-
-- 插件 `package.json` 只声明 `peerDependencies: { "@deepseek-ai/cordis": ">=4.0.0-rc <5" }`，没有 DSH 版本范围或运行时版本检查。
-- 0.2.x 的 `SessionStore`/`AgentRegistry` 用 TS `private` + 普通字段；当前 JS 运行时属性名是 `store`、`detachEntered`、`tracker`、`writers`。若未来改成 ECMAScript `#private` 或重命名，插件会**静默降级**，而不是加载失败。
-- DSH 的 `storage` 表内部（`table.host.unit.descriptor`）是更深的实现细节，升级风险更高，但它只影响旧缓存清理，最坏留 warning。
-- boot reconcile（`lib/index.js:2320` 附近）会清理工作区中的 orphan id，能兜底一部分 workspace 残留；但它不清理 `pinnedSessionIds`、不修复“文件还在但列表消失”的中间态。
-
-### 5.4 稳定性结论
-
-- **同一版本内**：删除路径基本稳定；预检、超时、失败关闭做得比多数插件好。
-- **跨 DSH 版本**：脆弱。它不是“公开 API 之上”的实现，而是“公开服务 + 私有字段”的混合；升级时必须回归。
-- **提取建议**：把私有访问集中到一个 `compat/` 适配层，启动时做能力探测；关键能力缺失时在删除请求上返回 503/明确诊断，而不是继续执行。这样即使升级破坏，也能快速定位，而不是静默出错。
-
----
-
-## 6 独立提取可行性
-
-### 6.1 结论
-
-**可行**。删除功能与 `dsh-session-manager` 的其它能力（工作区归档、移动、预设迁移、标记、搜索、批量面板）之间是松耦合的；可以只提取：
-
-- Host：`deleteSession` + 后代发现 + 活动停止 + writer/cache 清理 + 认证 API；
-- Client：标题栏/侧栏删除入口 + 确认对话框 + 刷新；
-- 文件层：`session-files.js` 的 ID/路径/header 读取部分；
-- compat：`session-lifecycle.js`、`projection-cache-delete.js`、`zstd-frames.js`。
-
-不需要提取：工作区管理、会话移动、预设迁移、收藏/标签/备注、批量管理面板、更新检查、设置卡片。
-
-### 6.2 方案对比
-
-| 方案 | 做法 | 优点 | 缺点 | 结论 |
-| --- | --- | --- | --- | --- |
-| A. 原样复制删除代码 | 把 `deleteSession` 及相关文件整体拷入新包 | 快；行为与现有插件一致 | 继承 R1/R2/R3/R5/R7/R10/R11；仍与 `dsh-session-manager` 的标记/归档数据耦合 | 不推荐 |
-| B. 复制 + 加固（推荐） | 保留核心算法，修正清理顺序、pin、伪事件、能力探测、错误展示 | 安全性与可维护性更好；可独立发布 | 需要重写/测试约 1,000–1,500 行 | **推荐** |
-| C. 等待 DSH 上游提供删除 API | 不实现，向 DSH 提需求 | 最稳定 | 当前不可用；用户目标无法完成 | 长期方向，不是本轮方案 |
-
-### 6.3 推荐架构（方案 B）
-
-#### 6.3.1 目录与包
+### 4.1 总体架构
 
 ```text
 dsh-session-deleater/
   package.json
   cordis.patch.yml
-  index.js
-  client.js
+  index.js                  # Host 入口：路由、认证、能力探测
+  client.js                 # Client 入口：slot、确认框、刷新
   icon.svg
   locale/en.json
   locale/zh.json
   lib/
-    session-files.js
-    delete-service.js
+    session-files.js        # ID/路径/header/zstd 读取与校验
+    delete-service.js       # 预检、停止、提交、清理主流程
+    journal.js              # intent 持久化与重放
+    startup-reaper.js       # 隔离区、孤儿缓存、dangling pin/archive
+    media-purge.js          # secure purge：附件引用扫描与回收
     compat/
-      projection-cache-delete.js
-      session-lifecycle.js
-      zstd-frames.js
-  scripts/            # 由 build-system/sync.mjs 生成/同步
-    build.mjs
-    verify.mjs
-    host-contract.mjs
-    lib/...
+      session-lifecycle.js  # writer 收集/关闭、私有面探测
+      projection-cache.js   # tombstone、table.delete、旧版聚合
+      private-state.js      # sessions.store/agents.store 封装
+  scripts/                  # 由 build-system/sync.mjs 同步
   README.md
   FEASIBILITY@0.2.2-rc.3.md
-  .gitignore
+  REF-IMPLEMENTATION.md
+  TRACE.md
 ```
 
-- 包名：`@local/dsh-session-deleater`
-- 版本：`0.1.0`
-- `private: true`
-- `type: module`
-- `engines.node: ">=20.0.0"`
-- `peerDependencies: { "@deepseek-ai/dsh": "^0.2.2-rc.2" }`
-- 零 npm 依赖：Host 只用 `node:fs`、`node:path`、`node:crypto`、`node:zlib`、`node:stream` 等内置模块；不声明 `dependencies`，因此 build 走“不建树”分支，没有 `node_modules/` 与 `deps.lock.json`。
+Host 插件：
 
-#### 6.3.2 Host 半
+- `inject = ['webServer', 'workspaceRegistry', 'sessions', 'agents', 'sessionPersistence', 'sessionProjectionCache', 'connection']`；
+- `schedule`、`spillStore`、`storageDomain` 可选，缺失时降级并 warning；
+- 零 npm 依赖：只用 `node:fs`、`node:path`、`node:crypto`、`node:zlib`、`node:stream` 等内置模块；
+- Client 使用公开 slot，不依赖私有 Client 结构。
 
-`index.js`：
+### 4.2 删除提交点：rename
 
-```js
-export const name = "dsh-session-deleater";
-export const inject = [
-  "webServer",
-  "workspaceRegistry",
-  "sessions",
-  "agents",
-  "sessionPersistence",
-  "connection",
-];
-export function apply(ctx) {
-  const service = createDeleteService(ctx);
-  ctx.effect(() => ctx.webServer.register({
-    kind: "prefix",
-    path: "/session-deleater/api",
-    handler: (req, res) => service.handle(req, res),
-  }), "session-deleater: api");
-}
+**不要在“已 detach、尚未 rm”的窗口做不可逆清理。** 采用：
+
+1. 预检、停止活动、`flush`、安装 cache tombstone；
+2. 把会话目录 `rename` 到 `<DSH_HOME>/.session-deleter-trash/<ts>-<encoded-id>-<rand>/`；
+3. rename 成功后 canonical 路径原子消失，删除语义成立；
+4. 再做 detach/关闭 writer/删除隔离目录/清缓存/workspace/客户端；
+5. 任何后续失败只影响残留清理，不会产生“文件还在、列表没了”；
+6. 崩溃后由 journal + 启动清理完成。
+
+为什么放在 `sessions` 根之外：
+
+- `list()` 会遍历 `<sessions root>/<project>/*`；放在 project 下的隔离目录仍可能被当成会话；
+- `<DSH_HOME>` 与默认 sessions 根通常同一文件系统，`rename` 原子；
+- 若 sessions 根在另一个卷，`rename` 可能 `EXDEV`，回退到“先 detach、再原地 rm”的兼容路径，并明确报告竞态风险。
+
+### 4.3 删除阶段
+
+```text
+P0  intent
+    持久化 { id, header(createdAt,cwd,isSeeded,parentSession,origin),
+             subtreeIds, attachmentIds?, quarantinePath? }
+
+P1  preflight
+    - stat(id).location.path；live/subtree/capability/path/header identity
+    - 目标子树不可读 -> 拒绝；无关空目录 -> warning
+    - 模型工具发起且目标是当前会话 -> 拒绝
+    - 读取 workspace/session-activity 预览
+
+P2  stop
+    - agent.cancel({kind:'disposed'}) + whenIdle()
+    - ctx.parallel('workspace/session-stop', {sessionId})
+    - 再查 activity；仍有活动 -> 中止
+
+P3  flush + cache tombstone + media inventory
+    - ctx.sessions.flush(session)（live）
+    - 在 session_projcache 上安装生命周期 tombstone
+    - secure purge 时在 rename 前提取 attachmentIds 写入 intent
+
+P4  commit: rename
+    - rename 前再次 lstat/realpath
+    - rename(sessionDir, quarantineDir)；fsync 父目录
+    - 关闭冷会话的 flock/open write 互斥 handle
+    - 失败：回滚 tombstone；会话仍完整；报告
+
+P5  live teardown（仅热会话）
+    - entry.detach()               // 真实 session/disposed
+    - agents.detachEntered(entry)  // session 已消失，避免 API 重加
+    - closeSessionWriters(tracker) // 等待写句柄关闭
+    - 失败：保留 quarantine + intent；报告待重试
+
+P6  delete quarantine
+    - rm(quarantineDir, { recursive:true, force:true, maxRetries })
+    - fsync 隔离区父目录
+    - 失败：保留 intent；不阻塞 P7；启动重试
+
+P7  metadata / cache / client
+    - 身份校验后 table.delete(id)
+    - 所有 workspace detachSession(id)
+    - unpinSession(id), unarchiveSession(id)
+    - 计划任务：默认 active target；secure purge 清全部引用
+    - 冷会话发 api-session/removed(id)
+    - Client 删除会话级 localStorage 键；清 current
+
+P8  media (可选 secure purge)
+    - 使用 intent.attachmentIds
+    - 扫描剩余会话引用
+    - 删除无其他引用的对象/引用路径；清 request-image 缓存
+    - 删除 provider upload index 中匹配记录
+    - 远端 provider 文件不承诺删除
+
+P9  finish
+    - P6 完成且 P8 完成（或未启用）时删除 intent
+    - secure purge 延后到启动时：保留 intent.attachmentIds
 ```
 
-API：
+**启动清理**（`sessionPersistence` 可用后）：
+
+- 重放 pending intents（验证 header 身份）；
+- 清理隔离区中超过阈值的残留；
+- 清理 `session_projcache` 中不在持久化列表里的孤儿记录（含 `.bak.*`）；
+- 清理 `pinnedSessionIds`/`archivedSessionIds` 中既不 live 也不 persisted 的 id；
+- 不主动改写 workspace `sessionIds`：DSH boot reconcile 已负责，且无条件 detach 可能误删 id 复用后的新成员。
+
+### 4.4 冷/热/当前/子树/fork 策略
+
+| 场景 | 策略 |
+|---|---|
+| 冷会话 | 主路径；rename + journal；不依赖 live 私有面。 |
+| 热会话 | 非公开 detach + writer close；Agent scope 留到进程退出；关键私有面缺失则拒绝。 |
+| 当前会话（UI 标题栏） | 允许；成功后先 `clearMain()` 离开，再删草稿；被级联删除的子会话也会离开。 |
+| 当前会话（模型工具） | 禁止；删除目标应排除调用方 session。 |
+| 顶层会话带 subagent | 级联删除 `origin === 'subagent'` 的子树；子先父后 rename。 |
+| 只删 subagent | 允许但提示父会话 catalog 仍保留 id/标题；父日志不可改写。 |
+| Fork | `isSeeded` 但 `origin !== 'subagent'` 是独立副本，不自动级联。 |
+| `session-reference` | 内容已复制到引用方日志；删源不影响副本，提示不可撤回。 |
+
+### 4.5 缓存与迟到写入
+
+- 在 `session/disposed` 之前安装 **生命周期 tombstone**：`table.put` 对同一 `createdAt/cwd/isSeeded` 的写入直接忽略；
+- 提交后 `table.delete(id)`；删除前检查 `table.get(id).identity.createdAt`，避免 id 复用误删新缓存；
+- tombstone 用 TTL/容量上限，成功后按 id 清理；不能无限累积；
+- 启动时清理孤儿缓存。实测 4 份孤儿说明这不是理论问题；
+- 旧版聚合 `storages/session_projcache.json` 若存在，按 legacy lock + 原子替换；未知 unit/schema 拒绝修改；
+- 跨进程：tombstone 只在本进程；启动孤儿清理兜底；多进程共享 sessions root 时应加跨进程锁。
+
+### 4.6 写互斥
+
+- **冷会话不要强制 `open(id,'write')`**：它会读取并验证整个日志；损坏/超大/历史日志会让删除本身失败。
+- 首选 `rename` 作为提交点；可选原生 `flock(session.lock)` 做额外互斥（不读日志、不触发迁移）。
+- `open('write')` 只作为“非损坏、v4、可接受整日志读取”的兼容路径；历史格式会迁移，禁止。
+- 热会话已经持有写 handle，不能 `open`；靠 `entry.detach()` + `tracker` 关闭 writer。
+- **绝不能在持锁 writer 仍活跃时 unlink `session.lock`**；rename 不 unlink，锁随目录移动。
+
+### 4.7 非公开面与能力探测
+
+允许使用非公开函数，但必须集中、探测、失败关闭。
+
+| 符号 | 用途 | 缺失时 |
+|---|---|---|
+| `ctx.sessions.store` / `SessionEntry.detach()` | 移除 live session，发真实 `session/disposed` | 热删除拒绝；冷删除不需要 |
+| `ctx.agents.store` / `AgentRegistry.detachEntered(entry)` | 移除 live agent，发 `agent/disposed` | 热删除拒绝；不要退化为静默 `store.delete` |
+| `persistence.tracker.writers` / `openHandles` | 找到并关闭写句柄 | 默认热删除拒绝；仅在明确接受 open handle 留到进程退出时继续（Windows 可能阻塞删除） |
+| `sessionProjectionCache.requireTable()` 或 `storageDomain.get('session_projcache').table('sessions')` | tombstone + `table.delete` | 冷删除可退化为直接删文件 + 启动孤儿清理；热删除拒绝 |
+| `api-session/removed` | 冷会话通知 API 列表 | 可退化为客户端 refresh；不要伪造 `session/disposed` |
+| `workspaceRegistry.list()` + `detachSession()` | 清工作区成员 | 缺失则 warning + 启动 reconcile |
+| `workspaceRegistry.unpinSession()` / `unarchiveSession()` | 清 pin/archive | 缺失则 warning |
+| `ctx.parallel('workspace/session-stop')` | 停 jobs/subagents/schedule | 热删除拒绝；冷会话通常不需要 |
+| `entity.record` / `stopSessionActivity` / `coordinator` | 不需要 | 不要依赖；用公开 `detachSession`、公开事件 |
+
+实现要求：
+
+- 启动时计算 `capabilities`，通过 `/health` 或日志输出；
+- 热删除进入前检查热必需能力，缺失返回 `delete-unsupported`（HTTP 503/409），**不停止任何东西**；
+- 冷删除不要求 live 私有面；
+- `package.json` 精确锁定 `@deepseek-ai/dsh: 0.2.2-rc.3`（或至少 `~0.2.2-rc.3`）；
+- 私有字段当前是 TS `private` 普通属性；未来改成 `#private` 时探针失败，不得静默降级；
+- 不要把 `agent.scope.dispose()` / `agent.ctx.fiber.dispose()` 当作完整拆除；它不触发 `AgentLoop` teardown。
+
+### 4.8 范围：safe / secure / 不可承诺
+
+| 范围 | safe 默认 | secure purge |
+|---|---|---|
+| 日志目录（含所有代际） | 是 | 是 |
+| 投影缓存 / 旧版聚合 | 是 | 是 |
+| workspace `sessionIds` / pin / archive | 是 | 是 |
+| 计划任务 active target | 是（`session-stop`） | 是 |
+| 计划任务 paused/ended/involved | 否，warning | 是 |
+| 客户端会话 localStorage 键 | 是 | 是 |
+| 仅被该会话引用的附件 | 否 | 是（引用扫描） |
+| request-image 缓存 | 否 | 是（整目录清） |
+| provider upload index | 否 | 是 |
+| spill 文件 | 否 | 可选（root 可定位时） |
+| provider 远端 / 官方日志 / OTel / 导出 / 备份 | 否 | 否 |
+| 工作区文件 / Git worktree | 否 | 否 |
+
+### 4.9 失败、幂等与 id 复用
+
+- **提交前失败**：会话完整；tombstone 回滚；active 计划任务可能已停止，报告“活动已停，但会话未删”。
+- **提交后失败**：canonical 已消失；返回 `ok:true` + `warnings`；intent 保留，启动重试；若隔离目录未删，返回 `quarantinePath`。
+- **部分子树失败**：返回 `deletedSubagents`、`remainingSessionIds`、`partialFailure`；已 rename 的子目录尽量回滚，否则保留 journal。
+- **幂等**：第二次删除未知 id 返回 `ok:true, deleted:false`，不报错。
+- **id 复用**：P7 前重新 `stat(id)`；`createdAt` 不同则跳过 id-only 清理，避免误删新会话；缓存删除前检查 identity。
+- **Windows**：`rename` 可能因 open handle 失败；回退“先 detach、再原地 rm”，`rm` 加 `maxRetries`/`retryDelay`；不要假设 `session.lock` 存在。
+- **跨进程**：cache tombstone 是本进程；多进程删除需额外锁，或只允许一个删除者。
+
+### 4.10 UX 与 API
+
+Host API 前缀 `/session-deleater/api`，owner-only：
 
 | 方法 | 路径 | 作用 |
-| --- | --- | --- |
-| `GET` | `/session-deleater/api/preview?sessionId=` | 返回 `{ subagentCount, subagents: [{id,parentSession}] }`；扫描不完整时 500。 |
-| `POST` | `/session-deleater/api/delete` | body `{ sessionId }`；返回 `{ ok, result }` 或 `{ ok:false, error, code?, deletedSubagents, remainingSessions, partialFailure }`。 |
-| `POST` | `/session-deleater/api/batch`（二期可选） | body `{ sessionIds }`；逐条结果。 |
+|---|---|---|
+| GET | `/health` | 能力探测结果、版本、secure purge 可用性 |
+| GET | `/preview?sessionId=` | 子会话数、活动状态、计划任务引用、外部副本警告 |
+| POST | `/delete` | body `{ sessionId, media? }`；`media` 取 `keep` 或 `purge`；返回结果/警告/部分失败 |
 
-认证：
+认证：`ctx.connection.admit(req)`，要求 `owner` principal；body 上限 64 KiB；id 白名单校验。
 
-```js
-const admission = ctx.connection.admit(req);
-if (!admission || "rejection" in admission) return send(res, 401/403, ...);
-if (admission.peer?.principal?.kind !== "owner") return send(res, 403, ...);
-```
+Client 入口：
 
-`delete-service.js` 在现有 `deleteSession` 基础上做以下改动：
+- `conversation.session.header.actions`：当前会话标题栏删除；
+- `sidebar.workspaces.session.menu.item`：侧栏行“更多”菜单删除；
+- `sidebar.session.row.trailing` 是非交互图标，不放按钮；
+- 确认框 portal 到 `document.body`/overlay，避免 overflow 裁剪；
+- 确认框显示：标题、子会话数、是否运行中、计划任务引用、外部副本警告；
+- 预览失败/加载中禁用确认；成功后 `sessions.refresh()`、`workspaces.refresh()`；当前会话使用私有 `clearMain()`（best-effort）离开，并清理所有被删 id（含级联子会话）的客户端状态；
+- 失败显示 `deletedSubagents`/`remainingSessionIds`/`partialFailure`，不要只显示 message。
 
-1. **能力探测前置**：在停止任何东西之前，检查 `sessions.store`、`entry.detach`、`agents.store`、`agents.detachEntered`、`persistence.tracker` 等；关键能力缺失直接抛 `delete-unsupported`，不进入 live teardown。
-2. **清理顺序调整**：`rm` 之前只做“必须前置”的验证、活动停止、writer 排空、session/agent 脱离；`rm` 成功后再做 workspace detach、`unpinSession`、`unarchiveSession`、投影缓存、标记清理，全部按 warning 处理。
-3. **主会话复查**：`flush` 后、`detach` 前再跑一次活动检查；发现新活动则中止。
-4. **冷会话通知**：不再伪造 `session/disposed`；live 会话靠 `entry.detach()`，冷会话发 `api-session/removed(id)`（并封装在 `notifyColdRemoval()` 中，便于升级时替换）。
-5. **pin 清理**：成功后调用 `workspaceRegistry.unpinSession`。
-6. **writer 支持标志**：`sessionWriters` 返回 `{ supported, writers }`；`closeSessionWriters` 在 live 会话存在但 `supported === false` 时报错，而不是空数组通过。
-7. **Windows 重试**：`rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })`。
-8. **错误字段**：保留 `deletedSubagents`、`remainingSessionIds`、`partialFailure`，并加 `artifactRemainingPath`（如果 `rm` 失败）。
-9. **不依赖 `dsh-session-manager` 的 annotations/workspace archive store**：独立插件只处理 DSH 自己的 registry 状态；如果两个插件共存，旧插件的标记残留由旧插件自己处理（或后续再加可选适配）。
-10. **删除期隔离**：在关闭 writer 后、删除前，把会话目录 `rename` 到同 project 下的 `.deleting-<sessionId>-<random>`，再 `rm` 这个隔离目录；这样即使有并发 resume/materialize，也不会在原来的目录名上“复活”，删除完成后可检测隔离目录是否又被写出。若 rename 失败（Windows 锁），回退到直接 rm 并明确报告竞态风险。
+### 4.11 版本契约
 
-#### 6.3.3 Client 半
+- 插件版本 `0.1.0`；行为/接口变化 bump 版本。
+- 目标 DSH 精确 `0.2.2-rc.3`；升级后先跑能力探针与回归。
+- 私有面缺失：插件可加载；冷删除尽量可用；热删除返回 `delete-unsupported`。
+- 不可承诺项必须在 README/UI 中写明；不能把“本机删除”表述为“provider 删除”。
 
-用公开 slot：
+---
 
-| Slot | 用途 | 备注 |
-| --- | --- | --- |
-| `conversation.session.header.actions` | 当前会话标题栏删除按钮 | `list`，`replaceRisk: none`，owner props 无额外字段；标准 props 含 `sessionId`、`useSessions`、`useSessionStatus`。 |
-| `sidebar.workspaces.session.row.action` | 侧栏每行 hover 删除按钮 | `list`，owner props `{ sessionId, displayTitle }`；内置 `archive` order 100、`pin` 200；建议新按钮 order 300。 |
-| `sidebar.workspaces.session.row.hover` | 可选：hover 卡片里的删除说明 | 非必须。 |
+## 5 问题与解决办法
 
-注意：
+| 症状 | 根因 | 修法 | 注意 |
+|---|---|---|---|
+| 删除失败后列表消失、文件还在，重启又出现 | 先 detach/清理，后 rm；中间失败 | rename 作为提交点；提交后清理；journal | 不要在 rm 前做不可逆 detach |
+| 删除成功但缓存又出现 | `session/disposed` 触发迟到 `put`；`coldSnapshot` 写回 | 生命周期 tombstone + `table.delete` + 启动孤儿清理 | tombstone 要有 TTL/容量上限 |
+| v1-only 会话“删除成功”但日志仍在 | 固定 `ARTIFACT_NAMES` 漏 v1；`locate` 只给 v4 路径 | `stat.location` 或动态 `session.vN` | 未来 vN 也不要解码事件 |
+| 一个空目录导致所有删除预览失败 | 全局扫描要求 `complete=true` | 只对目标子树失败关闭；空目录 warning | 不要因无关损坏阻塞 |
+| 置顶会话删除后 pin 残留 | 只 unarchive，没 unpin | `unpinSession(id)` | 失败 warning + 启动清理 |
+| 冷会话删除后其它插件收到假的 `session/disposed` | 手动 emit `{id}`，不是 `Session` | 冷会话发 `api-session/removed(id)` | 不要构造假 Session |
+| 客户端草稿/布局仍留着 | 只 refresh，不删 localStorage | 精确删除会话级键 | 先导航离开再删 `dsh.conversation` |
+| 计划任务 paused/ended 仍引用已删会话 | `session-stop` 只清 active target | 预览显示引用数；默认提示仅停 active，secure purge 用 `schedule.list/edit` 清全部引用 | 默认保留 paused/ended 引用，UI 已明示 |
+| 删附件破坏了另一个会话 | 内容寻址共享 | 扫描剩余引用；不可读则保留 | 共享附件永远保留 |
+| 热删除后内存仍有会话 | Agent scope 未 unwind | 接受留到进程退出，或拒绝热删除 | 不要假装完全 dispose |
+| 同 id 新会话被误删 | id-only 清理 | 校验 `createdAt`；不匹配则跳过 | UUID 复用概率低但要有保护 |
+| Windows rename 失败 | open handle/锁 | 回退 detach+rm；`maxRetries` | 不要假设 `session.lock` |
+| provider 副本仍在 | 外部系统 | UI/README 明确“不撤回” | 不要承诺“彻底删除” |
+| 模型工具删当前会话中断自己 | 删除 turn 被 cancel | 禁止工具删除调用方 session | UI 标题栏可删 |
+| 升级后“成功但没清干净” | 私有字段改名/`#private` | 启动能力探测；失败关闭 | 精确版本 + 回归 |
 
-- `sidebar.session.row.trailing` 是“非交互图标”，不要放删除按钮。
-- `sidebar.session.row.action` 不存在；正确的 per-row hover 操作槽是 `sidebar.workspaces.session.row.action`。
-- 标题栏/侧栏都有 `overflow` 裁剪，确认对话框必须 portal 到 `document.body` 或专用 overlay root；现有插件的 `renderInOverlay` 证明了这条路径。
-- 触屏设备会隐藏 hover 操作槽；标题栏入口是触屏的兜底。如果两个入口都保留，触屏至少能打开会话后删除。
+---
 
-Client 流程：
+## 6 实施步骤
 
-1. 点击删除按钮 → 打开确认对话框；
-2. 并行请求 `/preview`，显示“将连带删除 N 个关联子会话”；
-3. 用 `useSessions`/`useSessionStatus` 判断当前会话是否 running，显示中断警告；标题栏路径也必须传入该状态（见 R11），不要依赖 `confirmFor.running`；
-4. 预览未完成或失败时禁用“确认删除”；
-5. 确认 → `POST /delete` → 成功则 `ctx.sessions.refresh()`、`ctx.workspaces.refresh()`，如果删的是当前会话则 `ctx.uiWorkspace?.clearMain?.()` 或 `ctx.sessions.clear?.()`；
-6. 失败则显示错误 + `deletedSubagents`/`remainingSessions`；成功但有 warning 也显示 warning。
+### 6.1 阶段
 
-#### 6.3.4 与 `dsh-session-manager` 共存
+**Phase 0：骨架与探针**
 
-如果两个插件同时启用：
+- 初始化 Git、`.gitignore`、`package.json`、`cordis.patch.yml`；
+- 同步 `build-system/` 的 `scripts/`；
+- 实现 `compat/private-state.js` 的 `capabilities` 探测；
+- `/health` 输出版本与能力。
 
-- 标题栏会出现两个删除按钮（`session-manager-header` 与新插件）；
-- 侧栏行操作会多一个删除按钮（旧插件没有这个入口，算互补）；
-- 两者的删除 API 独立，删同一个会话时第二个会返回 `deleted:false`/幂等成功。
+**Phase 1：冷删除核心**
 
-可选策略：
+- `session-files.js`：id 校验、路径编码、header 读取、`session.vN` 动态匹配；
+- `journal.js`：intent 持久化/重放；
+- `delete-service.js`：P1–P7（冷路径）、workspace/pin/archive、cache；
+- `startup-reaper.js`：隔离区、孤儿缓存、dangling pin/archive；
+- Host 路由 + owner 认证 + preview/delete；
+- 单元测试 + 一次性工作区手工验收。
 
-1. **默认双入口**，文档说明重复；用户可停用其中一个插件。
-2. **新插件只注册侧栏行操作**，把标题栏留给旧插件；但旧插件被卸载后，触屏用户缺少标题栏入口。
-3. **运行时检测旧插件**：用 `ctx.slots.entries("conversation.session.header.actions")` 判断是否已有 `session-manager-header`，有则跳过标题栏注册。`ctx.slots.entries` 在 `dsh-paged-workspace` 的调研中被标记为“运行时兼容层，不是稳定公开契约”，会增加脆弱性。
-4. **注册相同 id `session-manager-header` 覆盖旧按钮**：不推荐，属于劫持别的插件 cell。
+**Phase 2：热删除与 UI**
 
-建议首期采用 **1（默认双入口）+ 文档说明**；如果用户更在意界面干净，再选 3。这个决策留给用户。
+- `compat/session-lifecycle.js`：writer 收集/关闭，私有面缺失失败关闭；
+- 热 teardown：session detach → agent detach → writer close；
+- Client slot、确认框、预览、running 警告、错误详情；
+- 当前会话清理与刷新。
 
-#### 6.3.5 版本与构建
+**Phase 3：secure purge（可选）**
 
-- 用 `node build-system/sync.mjs dsh-session-deleater` 获取 `scripts/` 五件套与 `host-contract.mjs` 模板。
-- `package.json` 需要：
-  - `exports["."] = "./index.js"`、`exports["./client"] = "./client.js"`、`exports["./package.json"]`、`exports["./locale/*.json"]`；
-  - `dsh.bundle.patch = "./cordis.patch.yml"`；
-  - `dsh.client = { platform: "web", immediately: true, inject: ["@deepseek-ai/dsh-client-ui-slots"] }`；
-  - `files` 列出 `index.js`、`client.js`、`lib`、`cordis.patch.yml`、`icon.svg`、`locale/*.json`、`README.md`；
-  - `locale/en.json` 必须有 `meta.title`（build verify 要求）；
-  - `cordis.patch.yml` 的 `id` 与 Host 导出的 entry id 一致，且包含 `@local/dsh-session-deleater`。
-- `host-contract.mjs` 建议断言：
-  - Host 导出 `name`/`inject`/`apply`；
-  - `inject` 含 `webServer`、`workspaceRegistry`、`sessions`、`agents`、`sessionPersistence`、`connection`；
-  - Client 在 VM 中注册了 `conversation.session.header.actions` 与 `sidebar.workspaces.session.row.action`；
-  - patch 的 entry id 与包名正确；
-  - 无 `dependencies`、无 `node_modules/`。
-- `npm run build` 自动跑 `verify`；验收以 `npm run verify` 为准。
+- `media-purge.js`：附件引用扫描、shared 保留、request-image、provider index、spill；
+- 启动时无 live Agent 执行；不可读剩余会话则保留媒体；
+- 配置/请求选项 `media: 'purge'`。
 
-#### 6.3.6 许可证与归属
+**Phase 4：验收**
 
-`dsh-session-manager` 是 MIT。提取删除核心属于派生作品，应：
+- `npm run build`、`npm run verify`；
+- 功能/安全/崩溃/升级回归；
+- 完成后停止并提示用户重启 DSH。
 
-- 保留 MIT 许可证文本；
-- 在 README/FEASIBILITY 中注明删除核心源自 `hkkz9522/dsh-session-manager` 0.7.8 的 MIT 代码；
-- 不复制与删除无关的业务代码、图标、文案。
+### 6.2 包与构建
 
-### 6.4 工作量估计
+- 包名 `@local/dsh-session-deleater`，`private: true`，`type: module`；
+- `exports["."] = "./index.js"`、`exports["./client"] = "./client.js"`、`exports["./package.json"]`、`exports["./locale/*.json"]`；
+- `dsh.bundle.patch = "./cordis.patch.yml"`；
+- `dsh.client = { platform: "web", immediately: true, inject: ["@deepseek-ai/dsh-client-ui-slots"] }`；
+- `files` 包含 `index.js`、`client.js`、`lib/`、`cordis.patch.yml`、`icon.svg`、`locale/*.json`、`README.md`；
+- `locale/en.json` 必须有 `meta.title`；
+- 零 npm 依赖，构建走“不建树”分支；
+- `peerDependencies` 精确 `@deepseek-ai/dsh: 0.2.2-rc.3`。
+
+### 6.3 工作量
 
 | 部分 | 估计 |
+|---|---|
+| Host：session-files、journal、delete-service、compat、startup-reaper、路由/认证 | 600–800 |
+| Client：slots、确认框、API、样式、locale | 300–500 |
+| 测试：纯函数、Host 单测、手工验收 | 200–400 |
+| 构建/探针/文档 | 100–200 |
+| **合计** | **约 1,200–1,800 行** |
+
+### 6.4 许可证与归属
+
+若复用参考实现的删除核心代码，保留 MIT 许可证与来源说明；来源与调查记录见 `REF-IMPLEMENTATION.md`。若仅按本文重新实现，也应在 README 的“参考”中说明设计来源。
+
+---
+
+## 7 验证与验收
+
+### 7.1 静态与构建
+
+- `npm run build` 成功，自动 `verify` 通过；
+- `npm run verify` 检查 exports、patch、client、locale、icon、符号链接、依赖树、共享构建文件；
+- Host 在全新进程可导入；Client 在 VM 中注册两个 slot；
+- `/health` 能力探测输出完整。
+
+### 7.2 功能矩阵
+
+| 场景 | 预期 |
+|---|---|
+| 冷顶层会话 | 目录/缓存/workspace/pin/archive/客户端键全部清理；重启无幽灵 |
+| 热空闲会话 | 数据删除、registry 脱离、UI 行消失；Agent scope 留到退出 |
+| 热运行中会话 | 先 stop/waitIdle；成功删除；超时则中止且不删 |
+| 父会话 + 2 subagent | 预览 2；父子目录都删；结果含 deletedSubagents |
+| 只删 subagent | 子目录删除；父 catalog 引用保留并提示 |
+| fork 会话 | fork 保留；提示独立副本 |
+| 共享附件 | 删一个，另一个仍可读 |
+| 唯一附件 + secure purge | 对象/引用/索引删除 |
+| v1-only / v2 / v3 | 整个目录删除，不触发迁移 |
+| 空目录 + 损坏无关目录 | 不阻塞目标删除 |
+| 符号链接 / header 不一致 | 拒绝，目标不动 |
+| id 复用 | 新会话不被误删 |
+| 当前会话 UI 删除 | 成功、clearMain、草稿清理 |
+| 模型工具删当前会话 | 拒绝 |
+| 计划任务 active/paused/ended | active 停；paused/ended 预览显示引用数并提示默认保留，secure purge 清 |
+| 第二次删除 | 幂等成功、deleted:false |
+| Windows | 无 `session.lock` 假设；rename 回退/rm 重试 |
+
+### 7.3 安全验收
+
+- 无 cookie 的 POST → 401；非 owner/跨站 → 403；
+- body > 64 KiB → 400/413；
+- `../`、绝对路径、控制字符、URL 编码 → 400；
+- 符号链接/junction → 拒绝；
+- 删除只发生在 `<sessions root>/<project>/<session>` 内；
+- 只读/不可写目录 → 失败且不误删其它目录。
+
+### 7.4 崩溃与升级
+
+- 在 P0/P2/P4/P5/P6/P7 后 kill 进程：重启后 intent/隔离区/孤儿缓存被正确清理；
+- 多进程共享 root：第二个进程不能打开同一 writer；缓存写回由启动清理兜底；
+- DSH 升级：探针失败时热删除返回明确错误；冷删除尽量可用；
+- 升级后回归：`sessions.store`、`entry.detach`、`agents.detachEntered`、`tracker`、`requireTable`、`api-session/removed`。
+
+### 7.5 观测
+
+- 日志记录：id、阶段、耗时、警告、quarantinePath、capabilities 版本；
+- 不记录会话正文/标题/提示词；
+- 删除结果返回 `deleted`、`filesRemoved`、`deletedSubagents`、`warnings`、`partialFailure`、`quarantinePath`。
+
+---
+
+## 8 待用户确认
+
+以下决策已按“安全优先、可恢复、不过度承诺”综合；请确认或修改。
+
+### 8.1 热会话策略
+
+- **A（推荐）**：允许热删除。使用非公开 `sessions.store`/`entry.detach` + `agents.detachEntered` + writer close；Agent scoped 资源留到进程退出；UI/README 说明。
+- B：只允许冷删除；热会话返回“需要重启”。
+- C：热删除先归档隐藏，重启后再收尾。
+
+**影响**：A 的删除体验最好，但要接受私有面与内存残留；B 最保守；C 需要 archive 状态与启动收尾。
+
+### 8.2 附件/媒体策略
+
+- **A（推荐）**：默认 safe（保留附件）；`secure purge` 作为请求/配置选项，无 live 会话时立即执行、否则下次启动执行；共享附件永远保留。
+- B：所有删除默认 secure purge（更彻底，但可能影响其它会话性能，且需要扫描全部剩余会话）。
+- C：永不删附件。
+
+**影响**：A 最安全、可解释；B 更符合“彻底”直觉，但成本/风险高；C 会留下图片内容。
+
+### 8.3 子会话与 fork
+
+- **A（推荐）**：删顶层会话级联 `origin=subagent` 子树；fork 不级联；只删子会话时提示父 catalog 保留引用。
+- B：只允许删顶层，禁止单独删子会话。
+- C：按 lineage 级联 fork/引用副本（不推荐，可能误删独立副本）。
+
+### 8.4 计划任务与当前会话
+
+- **A（推荐）**：计划任务默认只停 active target；secure purge 清 paused/ended/involved；当前会话 UI 可删、模型工具不可删。
+- B：无论模式都清全部计划任务引用。
+- C：当前会话一律禁止删除。
+
+### 8.5 UI 与旧插件共存
+
+- **A（推荐）**：默认与 `dsh-session-manager` 双入口；README 说明重复；不劫持旧插件 slot id。
+- B：检测旧插件后隐藏标题栏按钮（依赖兼容层）。
+- C：只提供侧栏入口。
+
+### 8.6 兼容策略
+
+- **A（推荐）**：插件可加载；冷删除尽量可用；热删除关键私有面缺失返回 `delete-unsupported`。
+- B：任一私有面缺失就插件加载失败（更响亮，但影响 DSH 启动）。
+- C：静默降级（不推荐）。
+
+### 8.7 首期范围
+
+- **A（推荐）**：单条删除 + 标题栏/侧栏入口 + preview + 错误详情；批量二期。
+- B：首期同时做批量管理面板。
+
+---
+
+## 9 参考坐标
+
+### 9.1 本工作区文档
+
+- `TRACE.md`：§2–§5 会话生成与工件；§10 安全删除综合判断。
+- `REF-IMPLEMENTATION.md`：既有实现调查记录（历史参考；不是本文规范）。
+
+### 9.2 DSH 源码
+
+- `@deepseek-ai/dsh-session-persistence-jsonl/src/format.ts`：`projectKey`、`encodeSegment`、`logPath`、`toHeaderLine`
+- `.../src/index.ts`：`create`、`open`、`stat`、`list`、`materialize`、`appendLines`
+- `.../src/lease.ts`：`SessionWriteLease`、`session.lock`
+- `.../src/storage.ts`：`JsonlBackendTracker`、`openHandles`、`writers`
+- `@deepseek-ai/dsh-session/src/index.ts`：`SessionStore`、`entry.detach`、`session/disposed`
+- `@deepseek-ai/dsh-agent/src/index.ts`：`AgentRegistry`、`detachEntered`、`AgentHandle`
+- `@deepseek-ai/dsh-agent-loop/src/index.ts`：`initializeAgent`、teardown、writer close
+- `@deepseek-ai/dsh-session-projection-cache/src/index.ts`、`src/spec.ts`：`requireTable`、`session_projcache` v7
+- `@deepseek-ai/dsh-workspace/src/index.ts`、`src/entity.ts`：`detachSession`、`unpinSession`、`unarchiveSession`
+- `@deepseek-ai/dsh-schedule/src/index.ts`：`activeSessionTasks`、`stopSessionTasks`
+- `@deepseek-ai/dsh-attachment-local/src/store.ts`、`file-store.ts`、`request-image.ts`
+- `@deepseek-ai/dsh-session-log-deepseek/src/index.ts`：`dsh_session_log`、`delivery-accepted`
+- `@deepseek-ai/dsh-llm-deepseek/src/upload-index.ts`：`files-v3.json`
+- `@deepseek-ai/dsh-spill-local/src/store.ts`：`sessionDir`
+
+### 9.3 运行时路径
+
+- `~/.dsh/sessions/`
+- `~/.dsh/storages/session_projcache/sessions/`
+- `~/.dsh/storages/workspace.json`
+- `~/.dsh/storages/schedule.json`
+- `~/.dsh/attachments/v1/{objects,file-objects,files}/`
+- `~/.dsh/cache/attachments/request-images/`
+- `~/.dsh/llm-deepseek/files-v3.json`
+- `~/Library/Application Support/@deepseek-ai/dsh-desktop/Local Storage/leveldb`
+
+### 9.4 UI 与事件
+
+- `conversation.session.header.actions`：list，replaceRisk none。
+- `sidebar.workspaces.session.menu.item`：list，owner props `{ sessionId, displayTitle }`，使用 `useMenuOpenState` 关闭菜单。
+- `shell.overlay`：root list；确认框挂在这里，避免随行菜单卸载。
+- `sidebar.session.row.trailing`：非交互图标，不放删除。
+- `workspace/session-activity`：waterfall。
+- `workspace/session-stop`：parallel。
+- `api-session/removed`：emit，`(sessionId: SessionId) => void`。
+- `session/disposed`：emit，`(session: Session) => void`。
+
+---
+
+## 10 本轮结论
+
+1. 本插件可行，且应做成“本机安全删除”，不是“全宇宙彻底删除”。
+2. 冷删除以 `rename` 为提交点、journal 为恢复机制、能力探测为边界；热删除才使用非公开 detach。
+3. 默认 safe 保留附件/外部副本；secure purge 作为显式选项，无 live 会话时立即执行，否则下次启动执行。
+4. 实现前只需确认 §8 的七组决策；确认后按 §6 分阶段编码，完成后需要重启 DSH。
+
+---
+
+## 11 实施记录（2026-11-17）
+
+### 11.1 已实现
+
+- **Host 半** `index.js`：
+  - owner-only `POST /session-deleater/api/delete`、`GET /preview`、`GET /health`；
+  - 认证复用 `ctx.connection.admit(req)`；
+  - request body 上限 64 KiB；错误返回稳定的 `code`、`deletedSubagents`、`remainingSessionIds`、`partialFailure`、`quarantinePath`。
+- **删除服务** `lib/service.js`：
+  - 预检、子会话树、活动检查、停止、cache tombstone、flush、隔离 rename、live detach、writer close、隔离目录删除、workspace/pin/archive 清理、secure schedule 清理、媒体清理；
+  - 冷会话不依赖 live 私有面；热会话在关键私有面缺失时返回 `delete-unsupported`；
+  - id 复用保护：清理前重新 `stat` 并比较 `createdAt`；
+  - 冷会话移除通知使用 `api-session/removed`，live 会话使用真实 `entry.detach()`。
+- **启动恢复** `lib/service.js`：
+  - 重放 journal；
+  - 清理隔离区、孤儿投影缓存、悬空 pin/archive；
+  - 媒体清理在无 live 会话时执行，否则保留 intent 到下次启动。
+- **Client 半** `client.js`：
+  - `conversation.session.header.actions`（id `session-deleater-header`，order 30）；
+  - `sidebar.workspaces.session.menu.item`（id `session-deleater-menu`，order 550）；
+  - `shell.overlay`（id `session-deleater-overlay`）承载确认框，避免行菜单关闭时把对话框一起卸载；
+  - 确认对话框、预览、running/热会话分离提示、子会话数、计划任务引用、外部副本警告、媒体复选框；
+  - 成功后清理**所有被删 id（含级联子会话）**的会话级 localStorage；若当前会话（含被级联的子会话）在其中，先 `clearMain()` 再清状态；失败/部分失败在对话框内展示，不再使用原生 alert。
+- **测试** `tests/deletion.test.mjs`：冷删除、非法 id、热删除私有 detach/writer close、secure purge 共享/唯一附件四条用例。
+- **构建**：已同步 `build-system/scripts`，`scripts/host-contract.mjs` 断言路由、认证入口、health 与能力探针。
+
+### 11.2 与设计的偏差
+
+1. **冷删除不使用 `open('write')`**：按设计以 rename 作为提交点，避免完整读取日志；多进程写互斥依赖 rename 的 canonical 路径消失，未额外引入原生 `flock`。
+2. **媒体清理可能立即执行**：如果提交后确认没有 live 会话，则立即执行；否则保留 `mediaPending`，下次启动执行。UI 已说明“共享附件保留”。
+3. **热删除的 Agent scoped 资源保留到进程退出**：与设计一致；未调用 `agent.scope.dispose()`。
+4. **计划任务默认只停 active target**：`workspace/session-stop` 负责 active target；`secure purge` 才通过 `schedule.catalog/edit` 清理所有引用。
+5. **无批量删除/管理面板**：按 8.7 决策，仅标题栏和侧边栏“更多”菜单。
+6. **当前会话仅在 UI 允许删除**：未提供模型工具；客户端先私有 `clearMain()`（best-effort）离开，再清 localStorage；级联删除的子会话也会清理。
+
+### 11.3 验证结果
+
+- `npm run build`：通过（依赖树、清单、slot、locale、icon、构建系统一致性、Host 探针）。
+- `npm test`：4/4 通过。
+- 安装：`plugin_manager install_bundle` 返回 `application: applied`，profile 已添加 `@local/dsh-session-deleater`。
+- 安装后活体 slot：`conversation.session.header.actions` 的 `session-deleater-header`、`sidebar.workspaces.session.menu.item` 的 `session-deleater-menu` 均为 `active: true`；`shell.overlay` 确认框已在页面刷新后的实删中使用（见 11.6）。
+- 未认证 `GET /session-deleater/api/health` 返回 401，证明 Host 路由已注册且认证失败关闭。
+- **已实测**：用户在重启后的 GUI 中创建并删除一条一次性会话，删除走通；删除后再次重启，Host 侧工件、投影缓存、工作区引用、journal/隔离区均已清理（详见 11.6）。
+- **仍未验证**：取消操作、部分失败展示、删除当前会话的导航、热删除、secure purge 的 GUI 路径；这些需要专门构造场景，未在本次实测覆盖。
+
+### 11.4 已知限制
+
+- 热删除的 Agent scoped 资源留到进程退出；关键私有面缺失时拒绝热删除。
+- 默认 safe 不删除附件；secure purge 仅删除无其他引用的对象，request-image 缓存整目录清空，provider 远端文件不删除。
+- provider/官方日志/OTel/导出/备份不可撤回。
+- 多进程 cache tombstone 只在本进程；启动孤儿清理兜底。
+- 未在 Windows 实测 `rename`/`rm` 的锁与重试行为。
+- 无批量删除；无用户可见回收站；rename 隔离区只是内部提交点。
+- 客户端 localStorage 的 Chromium LevelDB 在压缩前可能在 `.log` 中保留已删除键的历史字节；插件只能删除活动键，不控制 LevelDB 压缩。
+
+### 11.5 后续可选
+
+- 为 secure purge 增加可视化进度/下次启动提示；
+- 为单条失败增加“重试预览/重试删除”按钮；
+- 增加多进程删除协调锁；
+- 在 Windows 上专项验证；
+- 若上游提供正式 `deleteSession`/cache delete API，替换 `compat` 私有面。
+
+### 11.6 实测复核：单条会话删除（2026-11-17）
+
+用户删除 `session-ba1c7d75-59fd-4843-98af-806cbc73f296` 并重启后，按下列位置复核：
+
+| 位置 | 结果 |
 | --- | --- |
-| Host：session-files 裁剪 + delete-service + compat + 路由/认证 | 600–800 行 |
-| Client：slots + 确认对话框 + API 调用 + 样式 + locale | 300–500 行 |
-| 构建/探针/文档 | 150–250 行 |
-| 测试（单元 + 一次性会话手工/脚本） | 200–400 行 |
-| **合计** | **约 1,250–1,950 行** |
+| `~/.dsh/sessions/**/<id>` | 不存在；除当前会话自身的对话内容外，`~/.dsh` 中无该 id 的文件名或内容（含二进制检索） |
+| `~/.dsh/storages/session_projcache/sessions/<id>.json` | 不存在；32 个会话目录与 32 个缓存文件一一对应，无孤儿 |
+| `~/.dsh/storages/workspace.json` | `sessionIds`、`archivedSessionIds`、`pinnedSessionIds` 均无该 id |
+| `~/.dsh/dsh-session-deleater/pending.v1.json` | `entries` 为空 |
+| `~/.dsh/.session-deleter-trash` | 为空；无锁文件、临时文件残留 |
+| `~/.dsh/attachments`、`request-images`、`files-v3.json` | 该会话无附件；无新增或残留 |
+| 其他会话日志 | 解压全部 32 个 `session.v4.jsonl.zstd`，仅当前会话日志含该 id（因本轮对话提到它） |
+
+客户端复核：Chromium LevelDB 中 `dsh.conversation.<id>` 与 `dsh.sidebar-right.v1.<id>` 已有删除记录（DEL），`dsh.sessions.current` 已切回当前会话，活动键值中无该会话；`000060.log` 仍保留删除前的历史写入字节，属于 LevelDB 压缩前的正常行为，不是可读的活动状态。
+
+结论：DSH 的逻辑会话存储与索引已清除。文件系统空闲块、APFS 快照、备份以及 LevelDB 压缩前的历史日志不在本插件的物理擦除承诺内（见 1.2 与 11.4）。
 
 ---
 
-## 7 实施计划（待用户批准）
+## 12 删除确认按钮的悬停样式修复（2026-11-17）
 
-### 7.1 首期（Phase 1）
+### 12.1 目的与范围
 
-1. 初始化插件目录与 Git（`main` 分支），写 `.gitignore`。
-2. 写 `FEASIBILITY@0.2.2-rc.3.md`（本文）与实施后的 `README.md`。
-3. 从 `build-system/sync.mjs` 同步构建系统；填 `scripts/host-contract.mjs`。
-4. 实现 Host：
-   - `lib/session-files.js`（裁剪：ID、编码、目录断言、header 读取、zstd 首行读取）；
-   - `lib/compat/session-lifecycle.js`（writer 收集/关闭，带支持标志）；
-   - `lib/compat/projection-cache-delete.js`（tombstone/旧缓存清理）；
-   - `lib/delete-service.js`（后代发现、活动停止、删除主流程、pin/archive/workspace 清理、冷会话通知）；
-   - `index.js`（路由 + 认证 + 能力探测）。
-5. 实现 Client：
-   - 标题栏 + 侧栏行删除按钮；
-   - portal 确认对话框与预览；
-   - 成功/失败/部分失败展示；
-   - locale（中/英）与样式。
-6. 写测试：
-   - 纯函数测试：ID 校验、目录候选、路径拒绝、header 解析；
-   - Host 单元测试：使用临时目录 + 假 persistence/registry，模拟删除、级联、部分失败、缓存 tombstone；
-   - 手工验收：在一次性工作区创建会话/子会话，按第 9 节验证。
-7. `npm run build` + `npm run verify`。
-8. 完成需要重启 DSH 才能生效的改动后，停止并提示用户重启。
+修正删除确认对话框中“确认删除”按钮在 `:hover` 时文字与背景同时变灰、对比度不足的问题。只改本插件注入的对话框 CSS，不改 DSH 主题 token，也不改宿主按钮组件。
 
-### 7.2 二期（可选）
+### 12.2 现象与根因
 
-- 批量删除 API + 一个最小的多选管理面板（如果用户需要与旧插件一致的批量能力）。
-- 回收站/延迟删除（把工件移动到 `<home>/.trash/sessions/...`，保留 N 天）——这会改变“不可逆”契约，需要单独决策。
-- 配置项（是否显示标题栏/行入口、超时、是否启用回收站）——需要引入 `schemastery` 或 DSH 配置 schema，构建系统会要求 vendor 依赖。
-- 与 `dsh-session-manager` 的 annotations/workspace archive store 做可选清理适配（如果用户希望两个插件共存时不留残留）。
+现象：按钮默认是红底白字，悬停时变成灰底、文字也发灰，几乎看不清。
+
+本插件 `client.js` 中的相关规则：
+
+```css
+.dsd-btn:hover:not(:disabled){background:var(--dsw-alias-bg-layer-2)}
+.dsd-btn-danger{border-color:transparent;background:var(--dsw-alias-state-error-primary);color:var(--dsw-alias-label-on-color,#fff)}
+.dsd-btn-danger:hover:not(:disabled){filter:brightness(.94)}
+```
+
+根因是选择器特异性：`.dsd-btn:hover:not(:disabled)` 为 `(0,3,0)`，高于 `.dsd-btn-danger` 的 `(0,1,0)`。悬停时背景被通用规则覆盖为 `--dsw-alias-bg-layer-2`；危险按钮的 hover 规则只设置了 `filter`，没有重新声明 `background` 或 `color`。
+
+在浅色主题下：
+
+- `--dsw-alias-bg-layer-2` → `--dsw-static-neutral-bluish-00` → `rgb(255, 255, 255)`（`dsh-client-ui-theme/src/styles/design-platform.css` 第 182、56 行）；
+- `--dsw-alias-label-on-color` → `--dsw-static-neutral-bluish-00` → `rgb(255, 255, 255)`（同文件第 254、56 行）。
+
+于是悬停后变成“白底白字”，再叠加 `brightness(.94)`，文字和背景一起被压暗成灰色。深色主题下背景会被换成深灰层，但危险按钮的红色同样丢失。
+
+### 12.3 核心进路
+
+1. 让通用 hover 不再命中危险按钮：`.dsd-btn:not(.dsd-btn-danger):hover:not(:disabled)`。
+2. 在 `.dsd-btn-danger:hover:not(:disabled)` 中显式保持红色背景和 on-color 文本，并保留轻微加深：
+
+   ```css
+   .dsd-btn-danger:hover:not(:disabled){
+     background:var(--dsw-alias-state-error-primary);
+     color:var(--dsw-alias-label-on-color,#fff);
+     filter:brightness(.94);
+   }
+   ```
+
+3. 不加新的颜色 token，不引入动画；`busy`/`:disabled` 的透明度规则保持不变。
+
+### 12.4 问题与解决办法
+
+| 问题 | 处理 |
+| --- | --- |
+| 通用 hover 与危险 hover 同特异性，靠顺序覆盖 | 同时做“排除危险按钮”和“显式声明背景/文字”，避免依赖源码顺序 |
+| 深色主题下背景层是深灰，红色同样丢失 | 显式恢复 `--dsw-alias-state-error-primary`，与主题无关 |
+| 删除进行中按钮 disabled，hover 不生效 | 保持现有 `:disabled{opacity:.5}`；不再让灰色 hover 规则参与 |
+| 焦点可见性 | 保留现有 `:focus-visible` 规则，不把 hover 样式并入 focus |
+| 宿主全局按钮样式可能影响颜色 | 危险 hover 显式设置 `color`，不依赖继承 |
+
+### 12.5 验证计划
+
+- 浅色/深色主题下悬停“确认删除”：红底、白字、轻微加深；
+- 悬停“取消”“关闭”“重试”：保持中性层背景；
+- 删除进行中（disabled）：按钮半透明，不出现灰底灰字；
+- 键盘聚焦：focus ring 仍可见；
+- 构建后检查 CSS 字符串已更新（`npm run build`）。
+
+### 12.6 实施记录（2026-11-17）
+
+- 通用 hover 改为 `.dsd-btn:not(.dsd-btn-danger):hover:not(:disabled)`，不再命中危险按钮。
+- `.dsd-btn-danger:hover:not(:disabled)` 显式恢复 `background: var(--dsw-alias-state-error-primary)`、`color: var(--dsw-alias-label-on-color, #fff)`，并保留 `filter: brightness(.94)`。
+- 未改主题 token、未新增依赖；`busy`/`:disabled` 透明度与 focus 规则保持原样。
+- 验证方式：浅色/深色主题下人工悬停；构建后由 `npm run build` 检查 CSS 字符串与产物。
+- `npm run build` 通过（含 `npm test` 4/4）。
+
+### 12.7 完成态按钮改为中性（2026-11-17）
+
+删除完成/部分失败/导航失败后的第二个对话框是信息通报，不是再次确认；其“关闭”按钮沿用 `dsd-btn-danger` 红底白字会让用户误以为还要执行危险操作。本轮改为普通 `dsd-btn`（中性底、常规文字），按钮文本仍为 `T.close`（「关闭」/“Close”），行为只关闭对话框。
+
+- 不改变 completion 状态、警告列表、导航或删除结果；
+- 版本提升为 `0.1.2`；`npm run build` / `npm test` 通过。
 
 ---
 
-## 8 问题与解决办法
+## 13 删除当前会话后的自动导航（2026-11-17）
 
-| 症状 | 根因 | 修法 | 注意事项 |
+### 13.1 目的与范围
+
+删除**当前正在查看**的会话（或被级联删除的当前会话）后，不再停留在已删除会话的视图，而是自动打开一个仍存在的会话，或在当前工作区新建/复用空白会话。删除非当前会话不改变当前视图。
+
+### 13.2 现象与证据
+
+现象：用会话标题栏按钮删除当前会话后，页面仍停留在原会话位置，内容仍可见，只有标题回退成 session id；点击侧边栏另一个会话后才完全消失。
+
+- `uiWorkspace` 的公开契约在 `dsh-client-ui-workspace/src/client/navigation.ts`：
+  - `openSession(target)`（第 45 行）：选择会话并显示其 Conversation；
+  - `connectWorkspace(workspaceId)`（第 82 行）：复用或创建该工作区的空白会话；
+  - `startSession(workspaceId?, options?)`（第 91 行）：打开 `connectWorkspace` 解析出的空白。
+- 同一文件第 515 行的 `clearMain()` 是 `UiWorkspaceService` 的**私有方法**，不在 `UiWorkspace` 接口中；它被 `archiveSession`（第 384 行）在归档当前会话时内部调用，所以归档会回到 New Session 空态。
+- 本插件修改前的 `client.js` 中 `clearCurrent(ctx)` 调用 `ctx.uiWorkspace?.clearMain()`；当时 client 的 `inject` 只有 `['slots']`，未注入 `uiWorkspace`。内置客户端插件访问该服务时均显式声明 `inject`（例如 `dsh-client-ui-chat`、`dsh-client-ui-schedule`）。因此该调用要么没有可用服务，要么依赖私有方法；两者都不应作为契约。
+- 删除后 Host 列表事件把该行从 `sessions.byId` 移除；`SessionSummary.displayTitle` 的兜底顺序是 durable title → project basename → session id（`dsh-api-session-controller/src/client/sessions/service.ts` 第 31-32 行），于是标题显示 id。`mainReference` 仍保留旧会话，Conversation 继续渲染。
+
+### 13.3 核心进路
+
+- 删除成功后，若 `deletedIds` 包含当前选择（`localStorage['dsh.sessions.current']` 的 `sessionId`），在清理会话级 localStorage **之前**导航：
+  - 打开仍存在的会话：`ctx.uiWorkspace.openSession(target)`；
+  - 或打开当前工作区的空白：`const id = await ctx.uiWorkspace.connectWorkspace(workspaceId); ctx.uiWorkspace.openSession(id)`。`connectWorkspace` 会复用空白，没有空白时才创建。
+- 不再调用 `clearMain`；不伪造私有选择状态。
+- 在对话框打开时捕获目标行所属 `workspaceId`（header/menu 都有 `useWorkspaces`），避免删除后列表刷新导致无法反查。
+- 顺序：删除成功 → 计算排除 `deletedIds` 的候选 → 导航 → 清理会话级 localStorage → `refresh`。这样 `removeSessionLocalState` 看到的是新 selection，不会把刚写入的 `dsh.sessions.current` 删掉。
+- 导航失败不把删除标记为失败：删除已经提交；捕获导航异常，作为完成态警告或 `console.warn`，保留用户手动点击其他会话的能力。
+
+### 13.4 落点选择方案（待确认）
+
+| 方案 | 行为 | 优点 | 代价 |
 | --- | --- | --- | --- |
-| 删除失败后会话从列表消失，但文件还在，重启又出现 | `rm` 前已经 `detach`/取消 agent，且 `detachFromWorkspaces`/`unarchive` 在 `rm` 前可能抛错（R1） | 把清理类步骤移到 `rm` 之后；`rm` 前只保留必要验证与 teardown；失败时报告工件路径 | 不要把 `rm` 之后才该做的事放到 `rm` 前；错误信息要可恢复 |
-| 冷会话删除后，某些插件收到 `session/disposed` 但参数不是 Session（R2） | 手动 `ctx.emit("session/disposed", {id})` | 冷会话改发 `api-session/removed(id)`；live 会话用真实 `entry.detach()` | 这是 API 包内部事件；封装在 `notifyColdRemoval()`，升级时回归 |
-| 已置顶会话删除后 `pinnedSessionIds` 仍有 id（R3） | 只 `unarchiveSession`，没 `unpinSession` | 成功后调用 `workspaceRegistry.unpinSession` | 失败只 warning，不撤销删除 |
-| DSH 升级后删除“成功”但 writer 没关/agent 残留（R5） | 私有字段缺失时 `?.` 静默跳过 | 删除前做能力探测；关键能力缺失直接 503/报错；writer 用 `{supported, writers}` | 不要把“清理可选”与“生命周期必需”混在一起 |
-| 一个损坏会话导致所有删除预览失败（R6） | 全局扫描要求 `complete` | 默认保持失败关闭；错误列出阻塞目录；可选受限模式 | 受限模式必须保证子会话完整性 |
-| 删除失败留下空会话目录，之后所有删除预览失败（R7） | `scanSessionHeaders` 把“目录存在但无工件”计为 `complete=false` | 区分空目录与损坏工件；空目录跳过并 warning | 空目录不可能藏子会话，跳过是安全的 |
-| 旧缓存 lock 崩溃后一直占用（R8） | lock 文件只在 finally 删除 | lock 写 pid/时间戳，超时检查；或后台重试 | 0.2.2 旧聚合文件少见 |
-| 删除窗口内并发 resume 可能重新 materialize 目录（R4） | 删除不经过 DSH 的 open/resume 入口，`materialize()` 会 `mkdir -p` | 删除期 id 墓碑 + 先把目录 rename 到隔离名再删 | 需实机复现；不能只靠插件自己的 `mutate` |
-| 冷会话删除时伪造 `session/disposed`，监听器抛错会打断删除（R2） | `ctx.emit` 无逐监听器错误隔离 | 改发 `api-session/removed(id)` 并 try/catch | 不要构造假 Session |
-| 标题栏删除不显示“正在运行”警告（R11） | 标题栏只传 `{id, displayTitle}`，警告读 `running` | 从 `useSessions`/`useSessionStatus` 取 running 传入 | 行路径目前有，应对齐 |
-| tombstone 不回收；`rm` 半失败回滚 tombstone（R8） | `remove()` 未清 key；`artifactsDeleted` 在 rm 后才置位 | 删除成功后清 key；rm 开始即标记不可回滚 | 避免同 id 还原被永久拦截 |
-| 部分失败时用户不知道已删了哪些子会话（R10） | 单条 `runWithAlert` 只显示 message | 错误对话框渲染 `deletedSubagents`/`remainingSessions` | 批量结果已有类似结构，复用 |
-| 删除当前会话后主面板没清空 | Client 没清 current | 成功后 `clearMain()`/`clear()` | 只在 `wasCurrent` 或当前 id 匹配时清 |
-| Windows 上删除偶发 `EBUSY/EPERM` | 锁文件/杀毒软件占用 | `rm` 加 `maxRetries`/`retryDelay` | 失败要报告路径，不要假装成功 |
-| 两个插件同时显示删除按钮 | 都注册标题栏 | 文档说明；或运行时检测旧插件；或只保留行入口 | 不要劫持旧插件 id |
-| 删除后 spill 文件/附件还在 | 不在删除范围 | README 说明；spill 由自身 30 天清理，附件内容寻址共享 | 不要为了“干净”删共享附件 |
+| **A. 同工作区最近会话（推荐）** | 在目标会话所属工作区内，按 `updatedAt` 倒序取第一个仍存在、非归档、非空白、非 subagent 的会话；没有则在该工作区新建/复用空白 | 稳定、简单；通常就是侧边栏第一行；删除测试会话后回到上一段工作 | 不严格等于“侧边栏下一行” |
+| **B. 侧边栏相邻行** | 按侧边栏当前可见顺序取被删行的下一行，没有下一行取上一行；没有则新建/复用空白 | 最符合“下一个”的直觉 | 需要复刻排序：`updated`/`manual`、pin、blank、archived filter、groupBy 的 flat/workspace 差异；耦合 `dsh.workspace.view.v5` 私有存储 |
+| **C. 总是新建/复用空白** | 删除当前后直接 `connectWorkspace(workspaceId)` | 最接近归档当前会话的“回到新会话” | 工作区里明明有其他会话时也开空白，可能不符合预期；没空白时会新建日志 |
+| **D. 回到 New Session 空态** | 需要调用私有 `clearMain` 或重建选择状态 | 与系统归档行为一致 | 依赖私有方法，回到本插件刻意避免的版本风险 |
 
----
+若选 A，候选过滤规则：
 
-## 9 验证与验收
+- 排除 `deletedIds`（含级联子会话）；
+- 排除 `archivedSessionIds`；
+- 排除 `blank === true`；
+- 排除 `origin === 'subagent'`（子会话不作为侧边栏落点）；
+- 按 `updatedAt` 降序，`id` 作为稳定的平局裁决。
 
-### 9.1 静态与构建
+当前会话是 subagent、或找不到所属工作区时：
 
-- `npm run build` 成功，且自动 `verify` 通过。
-- `npm run verify` 检查：
-  - 无符号链接/Finder 替身/macOS 边角文件；
-  - 无 `dependencies` 时无 `node_modules/`；
-  - `package.json` 的 `exports`、`dsh.bundle.patch`、`dsh.client`、locale 锚点、icon、`files[]` 全部满足；
-  - `index.js`/`client.js` 可解析；
-  - Host 半在全新进程里可导入；
-  - 构建系统共享文件与 `build-system/` 逐字节一致。
-- `host-contract.mjs` 的每条断言都打印并通过。
+1. 若父会话仍存在，可打开父会话；
+2. 否则打开全局最近更新的存活会话；
+3. 仍没有则 `startSession()`（由 DSH 选择当前/最近工作区）。
 
-### 9.2 功能验收（一次性工作区）
+### 13.5 问题与解决办法
 
-> 不要用用户真实会话做测试；新建一个临时工作区（例如 `/tmp/dsh-delete-test`）并在其中创建会话。
+| 问题 | 处理 |
+| --- | --- |
+| 删除父会话时当前是子会话（级联） | `deletedIds` 包含当前 id；落点取父会话的 `workspaceId`，并排除所有被删 id |
+| 删除后 `sessions.list` 尚未刷新，仍含已删行 | 候选过滤显式排除 `deletedIds`；不要依赖列表已更新 |
+| 当前 selection 仍是已删 id | 先导航再清 localStorage；`removeSessionLocalState` 只清理不再指向的键 |
+| `startSession` 是 `void`，异步创建，无法 await | 用 `connectWorkspace` 拿 id，再 `openSession(id)` |
+| 空白会话被自动打开 | 候选排除 `blank`；若工作区只有空白，`connectWorkspace` 复用它，不新建 |
+| 归档行不可打开 | 候选排除归档 id |
+| 删除成功但导航失败 | 保留完成态并显示警告；不把删除结果改成失败 |
+| 工作区没有其他会话 | 按 A 的兜底新建/复用空白；是否需要新建待确认（见 13.6） |
+| 用户正在运行会话 | 删除会中断；导航到下一个会话，不保留旧视图 |
 
-1. **冷会话删除**：创建会话 → 关闭/重启后不打开 → 从侧栏行删除 → 工件目录、投影缓存行、workspace 成员、pin、archive 均消失。
-2. **live 空闲会话删除**：打开会话 → 标题栏删除 → 确认 → 当前面板清空，列表消失，工件删除。
-3. **live 运行中会话删除**：发一条长任务 → 删除 → 应取消、等待空闲、删除；若 3 秒内无法停止，应报超时且不删文件（可重试）。
-4. **级联**：创建一个父会话与两个子智能体会话 → 预览显示 `subagentCount: 2` → 删除父 → 三个工件都消失；结果含 `deletedSubagents`。
-5. **部分失败**：把一个子会话目录设为不可删除（权限/只读）→ 删除父 → 应删除其它可删的后代、主会话保持，错误含已删/剩余 id；修复权限后可重试。
-6. **幂等**：同一会话连续删除两次 → 第二次返回成功且 `deleted:false`/`filesRemoved:false`，无异常。
-7. **未知/非法 id**：`../x`、绝对路径、控制字符、空 → 400，磁盘无变化。
-8. **符号链接**：把 sessions 下某 project/session 目录替换为指向别处的符号链接/junction → 删除被拒绝，目标不动。
-9. **header 不一致**：目录名匹配但 header id 不同 → 拒绝。
-10. **并发**：两个客户端同时删同一会话 → 不出现双重 `rm` 异常；第二个幂等成功。
-11. **投影缓存竞态**：删除时故意延迟 cache `put` → tombstone 应阻止写回；删除后缓存文件不存在。
-12. **并发 resume**：一个客户端删除，另一个客户端在删除窗口内尝试发消息/resume；删除完成后原目录不应被重新 materialize。若无法稳定复现，至少用代码审查 + 故障注入确认隔离 rename 生效。
-13. **空残留目录**：手工在 `sessions/<proj>/` 造一个空目录 → 删除其它会话的预览不应被阻塞；修复后的扫描器应把它降级为 warning。
-14. **pin 清理**：置顶一个会话 → 删除 → `storages/workspace.json` 的 `pinnedSessionIds` 不再含该 id。
-15. **标题栏 running**：在运行中的会话上从标题栏打开确认框 → 应显示“删除将立即中断它”。
-16. **重启**：删除后重启 DSH → 列表无幽灵行，workspace/pin/archive 一致。
+### 13.6 决策（2026-11-17 已确认）
 
-### 9.3 安全验收
+用户确认：
 
-- 无 cookie 的 `POST /delete` → 401。
-- 非 owner / 跨站 Origin → 403。
-- 请求体超过 64 KiB → 400/413，不进入删除。
-- `sessionId` 注入路径分隔符/URL 编码 → 400。
-- 只读/不可写目录 → 删除失败且不误删其它目录。
+1. 落点策略采用 **A：同工作区最近更新的其他会话**；
+2. 工作区没有其他会话时，允许自动新建/复用空白（`connectWorkspace` 优先复用，没有空白才创建）；
+3. 导航失败只作为完成态警告，不把删除结果改成失败。
 
-### 9.4 UI 验收
+### 13.7 实施记录（2026-11-17）
 
-- 标题栏与侧栏按钮的 aria-label、tooltip、禁用态正确。
-- 确认对话框在浅色/深色主题下可读；portal 不被 sidebar/header 的 overflow 裁剪。
-- 预览加载中、失败、子会话数、running 警告均正确。
-- 删除成功后当前会话被清空；其它已打开客户端收到列表更新。
-- 部分失败时能看到“已删/剩余”信息。
-- 触屏宽度下标题栏入口仍可用（hover 入口隐藏时）。
+- Client `inject` 扩展为 `['slots', 'uiWorkspace', 'sessions', 'workspaces']`。
+- 删除成功后：
+  - 用实际删除集合（`deleted === true` 的目标 + 实际 `deletedSubagents`）判定当前选择是否被删；判定同时参考 `retainedBy.mainView` 与对话框打开时捕获的当前 id，避免 Host 先移除列表行后漏判；
+  - 当前会话被删时调用 `leaveDeletedCurrent`，只使用公开 `uiWorkspace.openSession` / `connectWorkspace` / `startSession`，不再调用私有 `clearMain`；
+  - 候选按工作区 `sessionIds` 取数，排除被删 id、归档、空白、`origin === 'subagent'`，按 `updatedAt` 降序；
+  - 没有候选时先 `connectWorkspace(workspaceId)` 再打开返回的空白；仍失败则回退到全局最近会话，最后 `startSession()`；
+  - 当前是 subagent 且父会话仍存活时优先打开父会话。
+- 打开顺序：删除成功 → 导航 → 清理会话级 localStorage → `refresh`；导航成功时 `removeSessionLocalState` 不再删除刚写入的 `dsh.sessions.current`。
+- 导航异常被捕获为完成态警告（`navigationFailed`），删除仍报告成功；不会把已提交的删除误报为失败。
+- 对话框在打开时捕获目标行所属 `workspaceId` 与当前标记，避免删除后列表刷新导致落点无法反查。
+- 版本提升为 `0.1.1`；README 已同步“同工作区最近会话”与 `uiWorkspace` 公开导航说明。
 
-### 9.5 升级回归
+验证计划（需重启/刷新 Client 后人工确认）：
 
-- 在 DSH 升级后，先运行 `npm run verify` 与 `host-contract.mjs`；
-- 再执行以下探测（可在插件启动日志或 API `/health` 输出）：
-  - `sessions.store` / `entry.detach`
-  - `agents.store` / `detachEntered`
-  - `persistence.tracker` / `writers` / `openHandles`
-  - `sessionProjectionCache.requireTable`
-  - `workspaceRegistry.unpinSession`
-- 任一关键项缺失：删除 API 返回明确错误，不执行 teardown。
-
----
-
-## 10 决策点（需要用户确认）
-
-1. **首期 UI 范围**：只做“标题栏 + 侧栏行”单条删除，还是同时做批量删除/管理面板？
-   - 建议：首期单条；批量二期。
-2. **与 `dsh-session-manager` 共存**：默认双删除按钮（简单稳定），还是运行时检测旧插件后隐藏标题栏按钮（界面干净但依赖 `ctx.slots.entries` 兼容层）？
-   - 建议：首期双入口 + 文档说明。
-3. **回收站/撤销**：是否要把“不可逆”改成“移动到回收站，N 天后清理”？
-   - 建议：首期保持不可逆（与现有契约一致）；回收站作为二期可选。
-4. **配置项**：是否需要“显示/隐藏标题栏/行入口、超时时间、回收站天数”等配置？
-   - 如果需要，构建系统要 vendor `schemastery`，并新增 Host `Config`。
-5. **兼容策略**：关键私有接口缺失时，是“插件加载失败”还是“插件加载但删除 API 报 503”？
-   - 建议：加载但不提供删除，返回 503 + 诊断；这样不会影响 DSH 启动，也便于用户看到原因。
-6. **许可证归属**：是否接受在 README/LICENSE 中注明删除核心源自 MIT 的 `hkkz9522/dsh-session-manager`？
-   - 建议：必须注明。
-
----
-
-## 11 参考坐标
-
-### 11.1 被调查插件
-
-- `~/.dsh/profiles/desktop/node_modules/dsh-session-manager/package.json`
-- `.../README.zh.md`（删除、级联、投影缓存、认证的说明，约第 20–27 行）
-- `.../lib/index.js`
-  - `scanSessionHeaders`：约 `:124`
-  - `unarchiveSession`：`:474`
-  - `detachFromWorkspaces`：`:606`
-  - `readSessionArtifact`：`:1816`
-  - `sessionDirOf`：`:1870`
-  - `findDescendantSubagents`：`:1883`
-  - `assertAndStopActiveSession`：`:1955`
-  - `deleteSession`：`:2019`
-  - 主会话 teardown：`:2094–2166`
-  - 失败/部分失败：`:2217–2228`
-  - 认证：`:2521`
-  - 路由：`:2568`
-  - 删除分支：`:2606`
-  - 批量删除：`:2691`
-  - 删除预览：`:2762`
-- `.../lib/session-files.js`
-  - `assertSessionId`：`:22`
-  - `encodeFsSessionSegment`：`:58`
-  - `candidateSessionDirs`：`:125`
-  - `assertSessionDirectory`：`:139`
-  - `readSessionHeader`：`:189`
-  - `readSessionFile`：`:214`
-- `.../lib/compat/session-lifecycle.js`
-  - `awaitSessionStep`：`:2`
-  - `sessionWriters`：`:17`
-  - `closeSessionWriters`：`:28`
-- `.../lib/compat/projection-cache-delete.js`
-  - `beginProjectionCacheDeletion`：`:16`
-  - `assertProjectionCachePath`：`:63`
-  - `removeLegacyProjectionCache`：`:78`
-- `.../lib/client.js`
-  - `ConfirmDialog`：`:3494`
-  - 单条删除确认：`:6631`
-  - 标题栏删除按钮：`:6491`
-  - 认证后的删除调用 `onRemove`：`:7312`
-  - slot 注册：`:7414`、`:7421`
-
-### 11.2 DSH 0.2.2-rc.3
-
-- `@deepseek-ai/dsh-session/src/index.ts`
-  - `SessionStore`：`:1144`
-  - `private store`：`:1145`
-  - `enter()` 与 `entry.detach`：`:1311–1344`
-  - `private detachEntered`：`:1347`
-  - `flush()`：`:1422`
-  - `session/disposed` 声明：`:65`
-- `@deepseek-ai/dsh-agent/src/index.ts`
-  - `AgentRegistry`：`:246`
-  - `private store`：`:250`
-  - `private detachEntered`：`:511`
-  - `get()`：`:580`
-- `@deepseek-ai/dsh-session-persistence-jsonl/src/index.ts`
-  - `private readonly tracker`：`:316`
-- `@deepseek-ai/dsh-session-persistence-jsonl/src/storage.ts`
-  - `JsonlBackendTracker`：`:391`
-  - `openHandles`：`:393`
-  - `private writers`：`:395`
-- `@deepseek-ai/dsh-session-persistence-jsonl/src/lease.ts`
-  - “POSIX lock 文件永不删除”的说明：`:118–123`
-- `@deepseek-ai/dsh-session-projection-cache/src/index.ts`
-  - `SessionProjectionCache`：`:105`
-  - `private requireTable`：`:398`
-- `@deepseek-ai/dsh-storage-domain/src/domain.ts`
-  - `KvTable`：`:43`
-  - `TableHost`/`host`：`:197`
-- `@deepseek-ai/dsh-storage/src/backend.ts`
-  - `KvUnit`：`:88`
-  - `layout`：`:64`
-- `@deepseek-ai/dsh-storage-json/src/index.ts`
-  - `descriptor.layout === 'per-record'`：`:69`
-  - `PerRecordJsonUnit` 私有 `descriptor`：`per-record-unit.ts:200–201`
-- `@deepseek-ai/dsh-workspace/src/entity.ts`
-  - `private record`：`:71`
-  - `detachSession`：`:175`
-- `@deepseek-ai/dsh-workspace/src/index.ts`
-  - `unarchiveSession`：`:420`
-  - `unpinSession`：`:477`
-- `@deepseek-ai/dsh-session-persistence/README.zh.md`
-  - “无删除或保留接口”：`:153`
-- `@deepseek-ai/dsh-workspace/README.zh.md`
-  - 会话删除尚未提供：`:171`
-- `@deepseek-ai/dsh-client-connection/src/index.ts`
-  - `/api` 的 `connection.admit(req)`：`:151`
-- `@deepseek-ai/dsh-client-connection/src/rpc.ts`
-  - `HostConnectionHandle.admit`：`:240`
-
-### 11.3 活体 Inspect（2026-11-17）
-
-- `conversation.session.header.actions`：`list`，`replaceRisk: none`，当前 occupants 含 `session-manager-header`（order 0）。
-- `sidebar.workspaces.session.row.action`：`list`，`replaceRisk: none`，当前 occupants 为 `archive`（order 100）与 `pin`（order 200）；owner props `{ sessionId, displayTitle }`。
-- `sidebar.session.row.trailing`：非交互图标，不适合放删除按钮。
-- `sidebar.session.row.action`：不存在（查询返回 `available: false`）。
-- `workspace/session-activity`：waterfall；`workspace/session-stop`：parallel。
-- `api-session/removed`：emit，签名 `(sessionId: SessionId) => void`。
-- `session/disposed`：emit，签名 `(session: Session) => void`。
-
-### 11.4 证据限制
-
-- DSH 源码以 `src/*.ts` 为准；对 `lib/*.js` 只抽查了 `dsh-session`/`dsh-agent` 的 `store` 与 `detachEntered` 仍为普通属性。其余私有字段在编译产物中的确切形状未逐一核对。
-- “并发 resume 重新 materialize”来自对 `persistBatch`/`materializePosix` 的静态推理，未在真实 DSH 进程中复现；文中已标为待验证。
-- `fs.rm` 对 Windows junction/只读文件的精确行为未在本机实测；相关建议按防御性设计给出。
-- 未删除任何真实会话；功能验收必须在一次性工作区进行。
-
----
-
-## 12 本轮结论
-
-1. `dsh-session-manager` 的删除实现不是简单的 `rm -rf`：它在 ID、路径、header、活动、writer、投影缓存和认证上都做了防御，整体安全性明显高于普通插件。
-2. 但它不是事务性删除，也不是公开 API 之上的实现：`rm` 前的清理顺序、私有的 `sessions.store`/`agents.store`/`persistence.tracker`/`requireTable`、伪造且无错误隔离的 `session/disposed`、未清理的 pin、删除窗口内的 resume/materialize 竞态、标题栏缺失的 running 警告，都是提取版应当修正的点。
-3. 提取为独立插件完全可行：Host 零 npm 依赖，Client 使用公开 slot；首期做单条删除 + 级联 + 预览 + 标题栏/侧栏入口即可。
-4. 本轮按工作区规则只产出调研文档，不写实现代码。下一步需要用户确认第 10 节的决策点，并新开一轮再开始实际编码。
+- 删除当前会话且有同工作区其他会话：自动打开最近更新者，旧内容消失，标题正确；
+- 删除当前工作区唯一会话：自动新建/复用空白，工作区保留；
+- 删除带 subagent 的父会话且当前是子会话：落到同工作区存活会话，不打开被删 id；
+- 删除非当前会话：当前视图不变；
+- 删除当前后导航失败：完成态显示警告，删除结果仍成功；
+- 悬停“确认删除”：红底白字，浅色/深色主题均正常；
+- `npm run build` / `npm test` 通过（4/4）。

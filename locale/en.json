@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Session deleter",
+    "description": "Delete a local session and its cached metadata, workspace references, and optional media. Does not retract content already sent to a model provider."
+  }
+}
