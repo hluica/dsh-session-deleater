@@ -250,7 +250,7 @@ if (dir !== undefined) {
 
 这是**最值得在提取版修正的顺序问题**。同理，`closeSessionWriters` 失败、`entry.detach()` 失败也会留下类似状态。
 
-**修法**：把所有“删除后清理”类操作（workspace detach、unpin、unarchive、缓存、标记）移到 `rm` 成功之后，并降级为 warning；`rm` 之前只保留必须前置的验证与 live teardown。若 `rm` 失败，明确报告“会话文件仍在 `<path>`，重启后可能重新出现”，并尽量提供恢复入口。
+**修法**：把所有“删除后清理”类操作（workspace detach、unpin、unarchive、缓存、标记）移到 `rm` 成功之后，并降级为 warning；`rm` 之前只保留必须前置的验证与 live teardown。进一步缩短 torn window：把 `entry.detach()` 紧贴 `rm` 之前执行，而不是在所有清理步骤之前；若 `rm` 失败且在进程内仍持有 session 对象，尝试重新 `enter`/`attach` 恢复（做不到就明确报告残留路径与重启后的行为）。若 `rm` 失败，明确报告“会话文件仍在 `<path>`，重启后可能重新出现”，并尽量提供恢复入口。
 
 #### R2. 没有 live entry 时伪造 `session/disposed`
 
