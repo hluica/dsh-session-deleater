@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-session-deleater",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": true,
   "type": "module",
   "description": "Safely delete a local DeepSeek Harness session, its projection cache, workspace references, and optional media.",
@@ -44,6 +44,6 @@
     "node": ">=20.0.0"
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh": "0.2.2-rc.3"
+    "@deepseek-ai/dsh": "~0.2.2-rc.3"
   }
 }

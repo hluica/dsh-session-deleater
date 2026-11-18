@@ -1,6 +1,6 @@
 # 会话删除（dsh-session-deleater）
 
-最后实质性修改于Harness版本：0.2.2-rc.3
+最后实质性修改于Harness版本：0.2.2-rc.5
 
 在会话区域标题栏与会话行“更多”菜单中提供删除入口；删除本机 DSH 存储中的会话日志、投影缓存、工作区引用和客户端会话状态，并可选清理仅属于该会话的媒体。
 
@@ -65,14 +65,14 @@ npm test
 
 ## 版本契约
 
-- 插件版本：`0.1.2`；行为、接口或删除范围变化时提升版本。
-- 目标 DSH：`0.2.2-rc.3`；升级后先运行 `npm run verify`，并检查 `/session-deleater/api/health` 的能力探针。
+- 插件版本：`0.1.3`；行为、接口或删除范围变化时提升版本。
+- 目标 DSH：`0.2.2-rc.5`；`peerDependencies` 使用 `~0.2.2-rc.3`，允许同一 minor 的 rc/patch 升级，跨 minor 升级仍需重新核对私有面。升级后先运行 `npm run verify`，并检查 `/session-deleater/api/health` 的能力探针。
 - 私有面缺失时：插件仍可加载；冷删除尽量可用；热删除返回 `delete-unsupported`，不静默降级。
 - 本插件的删除语义是“本机安全删除”，不是“provider/备份级彻底删除”。
 
 ## 命名与文件
 
-包名 `@local/dsh-session-deleater`，Loader entry id `dsh-session-deleater`。Host 入口 `index.js`，Client 入口 `client.js`，删除核心在 `lib/`。`REF-IMPLEMENTATION.md` 是参考实现调查记录；`FEASIBILITY@0.2.2-rc.3.md` 是实施契约；`TRACE.md` 是会话存储追踪与安全判断。
+包名 `@local/dsh-session-deleater`，Loader entry id `dsh-session-deleater`。Host 入口 `index.js`，Client 入口 `client.js`，删除核心在 `lib/`。`REF-IMPLEMENTATION.md` 是参考实现调查记录；`FEASIBILITY@0.2.2-rc.3.md` 是实施契约；`FEASIBILITY@0.2.2-rc.5.md` 是当前版本的兼容性复核记录；`TRACE.md` 是会话存储追踪与安全判断。
 
 ---
 
