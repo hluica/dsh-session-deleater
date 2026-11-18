@@ -38,7 +38,7 @@ requirements {"@deepseek-ai/dsh":"0.2.2-rc.3"}
 
 | 插件使用的符号 | rc.5 状态 | 依据（rc.5 源码/运行时） |
 |---|---|---|
-| `ctx.sessions.get/id`、`list()`、`flush(session)` | 可用，签名未变 | `@deepseek-ai/dsh-session` 的 `SessionStore.get/list/flush`；`flush` 仍以 `liveEntryFor()` 校验 live 会话 |
+| `ctx.sessions.get(id)`、`list()`、`flush(session)` | 可用，签名未变 | `@deepseek-ai/dsh-session` 的 `SessionStore.get/list/flush`；`flush` 仍以 `liveEntryFor()` 校验 live 会话 |
 | `ctx.sessions.store` / `entry.detach()` | 可用 | `SessionStore.store` 仍是运行时 `Map`；`enter()` 构造的 entry 仍暴露 `detach` |
 | `ctx.agents.store` / `AgentRegistry.detachEntered(entry)` | 可用 | `@deepseek-ai/dsh-agent` 的 `AgentRegistry.store` 与 `detachEntered` 仍在；TS `private` 仍编译为普通属性/方法 |
 | `agent.status`、`cancel({ kind: 'disposed' })`、`whenIdle()` | 可用 | `AgentHandle` 仍声明并实现这三个成员；`'disposed'` 仍在 `AgentCancelCause` 联合中 |
